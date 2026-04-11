@@ -182,6 +182,9 @@ async function runLoop(
 	const stuckFilesAlerted = new Set<string>();
 	const EDIT_ERROR_THRESHOLD_PER_FILE = 3;
 
+	// tau/sn66 v19: empty-diff safety net — only fires once
+	let emptyDiffNudged = false;
+
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
@@ -288,6 +291,36 @@ async function runLoop(
 			await emit({ type: "turn_end", message, toolResults });
 
 			pendingMessages = (await config.getSteeringMessages?.()) || [];
+		}
+
+		// tau/sn66 v19: empty-diff safety net. If the agent is about to exit
+		// without having made any successful edits, inject a continuation
+		// prompt. An empty diff always scores 0; even a partial attempt is
+		// better than nothing. Only fires once to avoid infinite loops.
+		const madeAnyEdit = newMessages.some(
+			(m) => m.role === "assistant" && Array.isArray(m.content) &&
+				m.content.some((c: any) => c.type === "toolCall" && (c.name === "edit" || c.name === "write")),
+		);
+		const hadSuccessfulEdit = newMessages.some(
+			(m) => m.role === "tool_result" && !m.isError && Array.isArray(currentContext.messages) &&
+				currentContext.messages.some((prev: any) =>
+					prev.role === "assistant" && Array.isArray(prev.content) &&
+					prev.content.some((c: any) => c.type === "toolCall" && (c.name === "edit" || c.name === "write")),
+				),
+		);
+		if (!hadSuccessfulEdit && !emptyDiffNudged) {
+			emptyDiffNudged = true;
+			pendingMessages.push({
+				role: "user",
+				content: [
+					{
+						type: "text",
+						text: "WARNING: You are about to finish with ZERO edits. An empty diff scores 0 and loses the round. Re-read the task, pick the most relevant existing file, and make at least one edit attempt. Use `grep` or `find` to locate the right file if unsure. Even a partial edit on the right file is better than no edit at all.",
+					},
+				],
+				timestamp: Date.now(),
+			});
+			continue;
 		}
 
 		// Agent would stop here. Check for follow-up messages.

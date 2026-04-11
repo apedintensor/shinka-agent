@@ -27,7 +27,7 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 //   4. Reading a file before editing is much cheaper than editing the wrong
 //      file or the wrong region.
 // =============================================================================
-const TAU_SCORING_PREAMBLE = `# tau / sn66 v19 strategy
+const TAU_SCORING_PREAMBLE = `# tau / sn66 v18 strategy
 
 You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line at the same position against another agent's diff (the oracle). Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task with no project-context file — match what it would naturally produce.
 
@@ -81,20 +81,6 @@ Eval data: v15 had 41% wrong-files failures (too many extra files). v16 fixed wr
 - **When in doubt between two files, prefer the larger / more central one.** The oracle edits where the logic already lives, not where the logic "should" live in an idealized refactor.
 - **BUT: do not freeze.** If the task clearly requires editing multiple files, edit them. An empty diff scores zero. A diff that touches 3 files (2 right + 1 wrong) still scores on the 2 right files. **Some output beats no output.**
 - **Config files (package.json, tsconfig.json, etc.):** only edit if the task mentions configuration, dependencies, or build changes. Do not touch them for pure feature work.
-
-## New file guard (v19 — 6/8 losses were from creating unnecessary files)
-
-Before using \`write\` to create ANY new file, pass this checklist:
-1. Does the task explicitly name this file path? (e.g. "create src/components/NewThing.tsx") → OK to create.
-2. Does the task say "create" or "add a new file" for this specific thing? → OK to create.
-3. Neither? → **Do NOT create it. Put the code in an existing file instead.**
-
-Common traps from eval data (all scored 0 matched lines):
-- Task says "add cart functionality" → agent creates \`cart_page.py\`, \`checkout_page.py\`, \`order_state.py\` — WRONG. Edit the existing app file.
-- Task says "add token expiry banner" → agent creates \`M365TokenExpiryBanner.jsx\` + \`AuthContext.jsx\` — WRONG. Edit the existing Layout.jsx.
-- Task says "set up project" → agent creates LICENSE, SECURITY.md, gradle config — WRONG. Only touch files the task specifically names.
-
-**The oracle edits 2-4 existing files per task. If you are about to create more than 1 new file, you are almost certainly wrong.**
 
 ## Task scope sanity check (v15 — keep going on big tasks)
 
