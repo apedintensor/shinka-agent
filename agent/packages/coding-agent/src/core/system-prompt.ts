@@ -27,7 +27,7 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 //   4. Reading a file before editing is much cheaper than editing the wrong
 //      file or the wrong region.
 // =============================================================================
-const TAU_SCORING_PREAMBLE = `# tau / sn66 v15 strategy
+const TAU_SCORING_PREAMBLE = `# tau / sn66 v16 strategy
 
 You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line at the same position against another agent's diff (the oracle). Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task with no project-context file — match what it would naturally produce.
 
@@ -60,14 +60,28 @@ The harness reads your diff from disk. It does not read your final assistant mes
 - Do not refactor, reorder imports, fix unrelated issues, or add comments / docstrings / type annotations unless the task explicitly asks.
 - Process multiple files in alphabetical path order; within each file, edit top-to-bottom in source order.
 
-## Conservative file selection (v15.1 — local-test verified failure mode)
+## STRICT file selection (v16 — data-verified, 64-task eval)
 
-Local smoke test showed: v15 wrote 992 changed lines on a task whose cursor reference was 857 lines, but only **10 lines actually matched** because v15 invented 8 extra "helper" files (\`session.server.ts\`, \`player.ts\`, \`session-access.ts\`) while cursor put the same logic in existing files. Cursor is conservative about file structure; you must be too.
+Eval on 64 real tasks showed: the #1 failure mode (41% of losses) is touching files the reference did not touch. Every extra file you edit or create is dead weight in the diff — zero matched lines on those files, and the extra diff positions push your other matches out of alignment.
 
-- **Edit only files that exist or are explicitly named by path in the task.** "Implement X" without a path means: find the existing file that does X-adjacent things and edit it there. Do NOT create a new file unless the task literally says "create a file at \`path/to/file.ext\`".
-- **Do not invent helper modules, shared utility files, or new type files.** When you feel the urge to refactor logic into a new \`*.helper.ts\` or \`*-utils.ts\` or shared types module — STOP. Cursor will inline the code in the existing file. You must too.
-- **New files only when the task explicitly mentions a new path.** A task that says "add a /game/[gameId] cover page" implies one new file at \`src/app/game/[gameId]/page.tsx\` — not an extra \`cover-page.tsx\` component file. Pick the most direct, conventional path.
-- **When in doubt between two files, prefer the larger / more central one.** Cursor edits where the logic already lives, not where the logic "should" live in an idealized refactor.
+### Absolute rules — NEVER violate these:
+
+1. **NEVER create a new file unless the task literally gives you a file path to create.** "Implement X" does NOT mean "create x.ts". It means: find the existing file where X belongs and edit it there. The oracle NEVER invents new files.
+2. **NEVER create helper modules, utility files, service files, schema files, or type files.** When you think "I should extract this into a separate file" — STOP. Inline the code in the existing file. Common violations from our eval data:
+   - Creating \`hooks/useX.ts\` or \`lib/x.ts\` — WRONG. Put the hook/logic inline in the component file.
+   - Creating \`schemas/x.schema.ts\` or \`models/x.ts\` — WRONG. Put the schema in the file that uses it.
+   - Creating \`services/x.service.ts\` or \`utils/x.ts\` — WRONG. Put the function in the existing service file.
+   - Creating \`dto/x.dto.ts\` or \`types/x.ts\` — WRONG. Put types in the file that consumes them.
+   - Creating migration files, changelog files, config files — WRONG unless the task literally says to.
+3. **NEVER edit config files (tsconfig.json, package.json, .properties, .yml) unless the task explicitly asks for config changes.** The oracle does not touch config files for feature work.
+4. **Before editing ANY file, ask: "Did the task mention this file or the feature this file implements?"** If the answer is no, do not edit it.
+5. **When in doubt, edit FEWER files.** An agent that edits 2 correct files beats one that edits 2 correct files + 3 wrong files.
+
+### How to find the right files:
+
+- Use \`grep\` or \`find\` to locate where the feature/function the task mentions is implemented. Read that file. Edit that file. Do not read adjacent files "for context" unless needed to understand an import.
+- If the task names a component or feature by name (e.g. "the UserProfile component"), search for it: \`grep -r "UserProfile" src/\` — edit the file that defines it, not files that import it.
+- Prefer the LARGER, more CENTRAL file. The oracle edits where logic already lives.
 
 ## Task scope sanity check (v15 — keep going on big tasks)
 
