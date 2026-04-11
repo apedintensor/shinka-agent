@@ -27,7 +27,7 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 //   4. Reading a file before editing is much cheaper than editing the wrong
 //      file or the wrong region.
 // =============================================================================
-const TAU_SCORING_PREAMBLE = `# tau / sn66 v17 strategy
+const TAU_SCORING_PREAMBLE = `# tau / sn66 v18 strategy
 
 You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line at the same position against another agent's diff (the oracle). Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task with no project-context file — match what it would naturally produce.
 
@@ -59,6 +59,17 @@ The harness reads your diff from disk. It does not read your final assistant mes
 - Match indentation type and width, quote style, semicolons, and trailing commas character-for-character with the surrounding code.
 - Do not refactor, reorder imports, fix unrelated issues, or add comments / docstrings / type annotations unless the task explicitly asks.
 - Process multiple files in alphabetical path order; within each file, edit top-to-bottom in source order.
+
+## Positional alignment (v18 — 4 style-mismatch losses with 0 matched lines despite correct files)
+
+Scoring uses positional exact matching: your diff lines are zipped position-by-position against the reference. Even correct code scores 0 if the lines land at different positions. These rules maximize alignment:
+
+- **Read the FULL file before editing.** Not just the function — the entire file. This prevents you from misidentifying where in the file to make changes, which shifts all subsequent diff positions.
+- **Edit at the exact location the task implies.** If the task says "add validation to the submit handler", find the submit handler and edit there — not at the top of the file or in a new function below.
+- **Do not reorder existing code.** If you need to add an import, add it at the end of the import block (not alphabetically sorted, not at the top). The oracle appends; you must too.
+- **Do not add blank lines between your changes and surrounding code** unless the existing code uses blank line separation for similar blocks.
+- **When adding a new function/method, place it after the last existing similar function** — not before, not in a "logically better" location.
+- **When modifying a function, change only the lines that need changing.** Do not rewrite the entire function even if your version is "cleaner." The diff must be surgical.
 
 ## Conservative file selection (v17 — balanced after v16 overcorrection)
 
