@@ -114,19 +114,49 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 	if (fuzzyIndex === -1) {
 		// Pass 3: indentation-blind match. The LLM frequently gets leading
 		// whitespace wrong while the semantic content is correct. Strip all
-		// leading whitespace per line from both sides and try again.
-		const stripIndent = (text: string) => text.split("\n").map((line) => line.trimStart()).join("\n");
-		const indentBlindContent = stripIndent(fuzzyContent);
-		const indentBlindOldText = stripIndent(fuzzyOldText);
-		const indentIndex = indentBlindContent.indexOf(indentBlindOldText);
+		// leading whitespace per line to find the match, then map back to
+		// original positions so the replacement preserves file indentation.
+		const fuzzyLines = fuzzyContent.split("\n");
+		const strippedLines = fuzzyLines.map((line) => line.trimStart());
+		const oldTextStripped = fuzzyOldText.split("\n").map((line) => line.trimStart());
 
-		if (indentIndex !== -1) {
+		// Find matching start line in stripped content
+		const oldFirstLine = oldTextStripped[0];
+		let matchStartLine = -1;
+		for (let i = 0; i <= strippedLines.length - oldTextStripped.length; i++) {
+			if (strippedLines[i] === oldFirstLine) {
+				// Check all lines match
+				let allMatch = true;
+				for (let j = 1; j < oldTextStripped.length; j++) {
+					if (strippedLines[i + j] !== oldTextStripped[j]) {
+						allMatch = false;
+						break;
+					}
+				}
+				if (allMatch) {
+					matchStartLine = i;
+					break;
+				}
+			}
+		}
+
+		if (matchStartLine !== -1) {
+			// Map back to original fuzzyContent: find char offset of matchStartLine
+			let charOffset = 0;
+			for (let i = 0; i < matchStartLine; i++) {
+				charOffset += fuzzyLines[i].length + 1; // +1 for \n
+			}
+			// Length of matched region in original content
+			let matchLen = 0;
+			for (let i = matchStartLine; i < matchStartLine + oldTextStripped.length; i++) {
+				matchLen += fuzzyLines[i].length + (i < matchStartLine + oldTextStripped.length - 1 ? 1 : 0);
+			}
 			return {
 				found: true,
-				index: indentIndex,
-				matchLength: indentBlindOldText.length,
+				index: charOffset,
+				matchLength: matchLen,
 				usedFuzzyMatch: true,
-				contentForReplacement: indentBlindContent,
+				contentForReplacement: fuzzyContent,
 			};
 		}
 
