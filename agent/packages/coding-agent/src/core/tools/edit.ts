@@ -256,11 +256,15 @@ export function createEditToolDefinition(
 								}
 
 								const diffResult = generateDiffString(baseContent, newContent);
+								const oldLineCount = baseContent.split("\n").length;
+								const newLineCount = newContent.split("\n").length;
+								const lineDelta = newLineCount - oldLineCount;
+								const deltaStr = lineDelta > 0 ? `+${lineDelta}` : lineDelta < 0 ? `${lineDelta}` : "±0";
 								resolve({
 									content: [
 										{
 											type: "text",
-											text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+											text: `Successfully replaced ${edits.length} block(s) in ${path} (${deltaStr} lines, ${newLineCount} total).`,
 										},
 									],
 									details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine },

@@ -169,13 +169,16 @@ function getNotFoundError(path: string, editIndex: number, totalEdits: number, f
 			}
 		}
 	}
+	// If searchText is long (>5 lines), suggest using a smaller snippet
+	const lineCount = searchText ? searchText.split("\n").length : 0;
+	const snippetHint = lineCount > 5 ? "\nTip: Your oldText is " + lineCount + " lines. Try a shorter, unique snippet (3-5 lines) that anchors to a distinctive line." : "";
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.${hint}`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.${hint}${snippetHint}`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.${hint}`,
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.${hint}${snippetHint}`,
 	);
 }
 
