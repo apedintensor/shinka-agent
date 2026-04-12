@@ -164,24 +164,6 @@ async function runLoop(
 	// Check for steering messages at start (user may have typed while waiting)
 	let pendingMessages: AgentMessage[] = (await config.getSteeringMessages?.()) || [];
 
-	// tau/sn66 v15.1: provider-error retry. Verified in local smoke test
-	// (smoke-batch-2): Gemini Flash via tau OpenRouter proxy intermittently
-	// returns finish_reason=error mid-stream, leaving the partial assistant
-	// message in context with no tool calls. Without retry the agent exits
-	// with 0 edits and produces an empty diff. With retry we inject a
-	// continuation prompt and try again.
-	let providerErrorRetries = 0;
-	const MAX_PROVIDER_ERROR_RETRIES = 3;
-
-	// tau/sn66 v15.2: consecutive edit-error detector. Verified in local smoke
-	// test (smoke-batch-3): the model can hallucinate oldText and get stuck in
-	// a retry loop on a single file, burning the entire 300s budget on one
-	// file while leaving 12 other files in the task untouched. After N edit
-	// errors on the same file, force the model to move on.
-	const editErrorsByFile = new Map<string, number>();
-	const stuckFilesAlerted = new Set<string>();
-	const EDIT_ERROR_THRESHOLD_PER_FILE = 3;
-
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
@@ -209,31 +191,7 @@ async function runLoop(
 			const message = await streamAssistantResponse(currentContext, config, signal, emit, streamFn);
 			newMessages.push(message);
 
-			if (message.stopReason === "aborted") {
-				await emit({ type: "turn_end", message, toolResults: [] });
-				await emit({ type: "agent_end", messages: newMessages });
-				return;
-			}
-
-			// tau/sn66 v15.1: provider error → inject continuation and retry
-			// instead of exiting. Caps at 3 retries to avoid infinite loops.
-			if (message.stopReason === "error") {
-				if (providerErrorRetries < MAX_PROVIDER_ERROR_RETRIES) {
-					providerErrorRetries++;
-					await emit({ type: "turn_end", message, toolResults: [] });
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "Your previous response was cut off by a provider error. Continue immediately with a tool call — do not write narrative text, call read or edit directly. The harness scores your diff from disk; an empty diff loses the round.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					hasMoreToolCalls = false;
-					continue;
-				}
+			if (message.stopReason === "error" || message.stopReason === "aborted") {
 				await emit({ type: "turn_end", message, toolResults: [] });
 				await emit({ type: "agent_end", messages: newMessages });
 				return;
@@ -250,38 +208,6 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
-				}
-
-				// tau/sn66 v15.2: track consecutive edit failures per file.
-				// When the same file accumulates >= threshold edit errors,
-				// inject a steering message to force the model off that file.
-				for (let i = 0; i < toolResults.length; i++) {
-					const tr = toolResults[i];
-					const tc = toolCalls[i];
-					if (!tc || tc.type !== "toolCall") continue;
-					if (tc.name !== "edit") continue;
-					const targetPath = (tc.arguments as { path?: string } | undefined)?.path;
-					if (!targetPath || typeof targetPath !== "string") continue;
-					if (tr.isError) {
-						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
-						editErrorsByFile.set(targetPath, next);
-						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
-							stuckFilesAlerted.add(targetPath);
-							pendingMessages.push({
-								role: "user",
-								content: [
-									{
-										type: "text",
-										text: `STOP editing \`${targetPath}\`. You have failed ${next} edit attempts on this file in a row, all with "Could not find oldText" errors. The model's mental copy of this file is wrong. Do ONE of the following NOW:\n\n1. Move on to a DIFFERENT file in the task — there are likely other files mentioned in the acceptance criteria you haven't touched yet.\n2. If you must keep editing this file, call \`read\` on it ONE MORE TIME to refresh your view, then make ONE small edit with a very short, unique oldText snippet (5-10 lines max). Do not paste large blocks.\n3. Never paste text you remember — only paste text you have JUST read in this session.\n\nDo not retry the failed edits. Move on.`,
-									},
-								],
-								timestamp: Date.now(),
-							});
-						}
-					} else {
-						// Successful edit on this file resets its error counter.
-						editErrorsByFile.set(targetPath, 0);
-					}
 				}
 			}
 
