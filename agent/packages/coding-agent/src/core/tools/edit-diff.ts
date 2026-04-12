@@ -112,6 +112,24 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
 	if (fuzzyIndex === -1) {
+		// Pass 3: indentation-blind match. The LLM frequently gets leading
+		// whitespace wrong while the semantic content is correct. Strip all
+		// leading whitespace per line from both sides and try again.
+		const stripIndent = (text: string) => text.split("\n").map((line) => line.trimStart()).join("\n");
+		const indentBlindContent = stripIndent(fuzzyContent);
+		const indentBlindOldText = stripIndent(fuzzyOldText);
+		const indentIndex = indentBlindContent.indexOf(indentBlindOldText);
+
+		if (indentIndex !== -1) {
+			return {
+				found: true,
+				index: indentIndex,
+				matchLength: indentBlindOldText.length,
+				usedFuzzyMatch: true,
+				contentForReplacement: indentBlindContent,
+			};
+		}
+
 		return {
 			found: false,
 			index: -1,
