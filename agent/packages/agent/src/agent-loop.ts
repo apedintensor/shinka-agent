@@ -177,6 +177,8 @@ async function runLoop(
 	const editErrorsByFile = new Map<string, number>();
 	const stuckFilesAlerted = new Set<string>();
 	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
+	// tau/sn66 v25: same-oldText failure detector — faster than threshold
+	const lastFailedOldText = new Map<string, string>();
 
 	// tau/sn66 v24: exploration budget + no-tool-call retry.
 	let readsWithoutEdit = 0;
@@ -295,6 +297,13 @@ async function runLoop(
 					if (tr.isError) {
 						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
 						editErrorsByFile.set(targetPath, next);
+						// tau/sn66 v25: same-oldText detector — catch repeated failures faster
+						const editOldText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
+						const prevFailed = lastFailedOldText.get(targetPath);
+						if (editOldText && prevFailed === editOldText && pendingMessages.length === 0) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit on \`${targetPath}\` failed with SAME oldText twice. Call \`read\` on it NOW, then retry.` }], timestamp: Date.now() });
+						}
+						lastFailedOldText.set(targetPath, editOldText);
 						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
 							stuckFilesAlerted.add(targetPath);
 							pendingMessages.push({
@@ -311,6 +320,7 @@ async function runLoop(
 					} else {
 						// Successful edit resets error counter + triggers freshness warning
 						editErrorsByFile.set(targetPath, 0);
+						lastFailedOldText.delete(targetPath);
 						hasEditedAnyFile = true;
 						readsWithoutEdit = 0;
 						// tau/sn66 v24: post-edit freshness — warn model that file changed
@@ -347,6 +357,17 @@ async function runLoop(
 						timestamp: Date.now(),
 					});
 					readsWithoutEdit = 0;
+				}
+
+				// tau/sn66 v25: ConnectionRefused detection — sandbox has no services
+				for (const tr of toolResults) {
+					if (tr.toolName === "bash" && !tr.isError) {
+						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
+						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: "STOP: Sandbox has NO services. Do NOT retry connections. Call `read` or `edit` NOW." }], timestamp: Date.now() });
+							break;
+						}
+					}
 				}
 
 				// tau/sn66 v24: hard exit before validator kills container

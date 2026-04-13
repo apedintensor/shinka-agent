@@ -2,8 +2,55 @@
  * System prompt construction and project context loading
  */
 
+import { execSync } from "node:child_process";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
+
+// tau/sn66 v25: pre-grep task keywords at prompt build time.
+// Extracts identifiers from the task description, greps the repo,
+// and injects matching file paths into the prompt. Saves 2-3 tool calls.
+function grepTaskKeywords(cwd: string, taskText: string): string {
+	try {
+		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map((k) => k.replace(/`/g, "")) || [];
+		const camelMatches = taskText.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || [];
+		const snakeMatches = taskText.match(/\b[a-z]+_[a-z_]+\b/g) || [];
+		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches])]
+			.filter((k) => k.length >= 3 && k.length <= 60)
+			.filter(
+				(k) =>
+					!["the", "and", "for", "with", "that", "this", "from", "should", "must", "when", "each", "into", "also"].includes(
+						k.toLowerCase(),
+					),
+			)
+			.slice(0, 10);
+		if (allKeywords.length === 0) return "";
+		const fileHits = new Map<string, string[]>();
+		for (const keyword of allKeywords) {
+			try {
+				const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+				const result = execSync(
+					`grep -rl "${escaped}" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" --include="*.go" --include="*.java" --include="*.kt" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.vue" . 2>/dev/null | grep -v node_modules | grep -v .git | grep -v dist/ | grep -v build/ | head -10`,
+					{ cwd, timeout: 3000, encoding: "utf-8" },
+				).trim();
+				if (result) {
+					for (const file of result.split("\n")) {
+						const clean = file.replace("./", "");
+						if (!fileHits.has(clean)) fileHits.set(clean, []);
+						fileHits.get(clean)!.push(keyword);
+					}
+				}
+			} catch {}
+		}
+		if (fileHits.size === 0) return "";
+		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
+		let result = "\n\n## Files matching task keywords\n\nThese files contain identifiers from the task. Start here:\n";
+		for (const [file, keywords] of sorted) {
+			result += `- ${file} (${keywords.join(", ")})\n`;
+		}
+		return result + "\n";
+	} catch {}
+	return "";
+}
 
 // =============================================================================
 // tau / sn66 strategy preamble — baked into the system prompt so it is loaded
@@ -41,9 +88,10 @@ Your time budget varies per task (40–300 seconds). You do NOT know how much ti
 ## Mandatory file discovery (BEFORE any edit)
 
 Before your first edit, run a quick search:
-- find . -type f -name "*.EXT" | grep -v node_modules | grep -v .git | head -40
+- find . -type f \\( -name "*.EXT" -o -name "Dockerfile" -o -name "*.json" \\) | grep -v node_modules | grep -v .git | head -60
 - grep -r "KEYWORD" --include="*.EXT" -l | head -10
 This costs 1 tool call but prevents editing the wrong file (which costs the entire round).
+After editing a file, check if there are **sibling files** in the same directory that also need editing.
 
 ## File selection (highest leverage)
 
@@ -142,7 +190,8 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		let prompt = TAU_SCORING_PREAMBLE + customPrompt;
+		const keywordHits = grepTaskKeywords(resolvedCwd, customPrompt);
+		let prompt = TAU_SCORING_PREAMBLE + keywordHits + customPrompt;
 
 		if (appendSection) {
 			prompt += appendSection;
