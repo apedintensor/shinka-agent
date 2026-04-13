@@ -27,26 +27,74 @@ import { formatSkillsForPrompt, type Skill } from "./skills.js";
 //   4. Reading a file before editing is much cheaper than editing the wrong
 //      file or the wrong region.
 // =============================================================================
-const TAU_SCORING_PREAMBLE = `# Task Solving
+const TAU_SCORING_PREAMBLE = `# tau / sn66 optimized strategy
 
-Your diff is scored by positional line-level exact matching against a reference solution. Score = matched_lines / max(your_lines, reference_lines).
+You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line against another agent's diff (the oracle) using longest common subsequence matching. Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task — match what it would naturally produce.
 
-## Workflow
+## Speed matters — you may have as little as 40 seconds
 
-1. Explore the codebase first. Use find/ls to see the file tree. Read 8-12 files to understand context before editing.
-2. Read every relevant file fully — imports, types, dependencies, related modules. Understanding the full context produces better edits.
-3. Edit ALL files that need changes. Most tasks require 5-10 file edits. Don't stop after 1-2 files.
-4. Use minimal, idiomatic edits. Prefer built-in APIs and one-liners. Match existing code style exactly.
-5. Process files alphabetically. Edit top-to-bottom within each file.
-6. Stop when done. No summary, no verification.
+Your time budget varies per task (40–300 seconds). You do NOT know how much time you have. An empty diff scores 0. Therefore:
+- **Never run tests, builds, linters, servers, or type checkers.** The sandbox has no running services. These waste your entire budget.
+- **One bash call maximum** at the start to find file paths. Then use read directly.
+- Your FIRST response MUST be a tool call. Never start with text or plans.
 
-## Style
+## Mandatory file discovery (BEFORE any edit)
 
-- Match indentation, quotes, semicolons, trailing commas, brace style from surrounding code.
-- Prefer idiomatic solutions — use standard library and built-in APIs, don't reimplement.
-- Each edit should be the smallest change needed. Don't rewrite functions when one line changes.
-- No extras: no comments, no type annotations, no error handling, no formatting fixes unless asked.
-- No git operations, no tests, no builds.
+Before your first edit, run a quick search:
+- find . -type f -name "*.EXT" | grep -v node_modules | grep -v .git | head -40
+- grep -r "KEYWORD" --include="*.EXT" -l | head -10
+This costs 1 tool call but prevents editing the wrong file (which costs the entire round).
+
+## File selection (highest leverage)
+
+- Read the task carefully and identify exactly which files it implies.
+- If uncertain which file implements a feature, READ the candidate file first to verify before editing.
+- Touch only the files the oracle would touch. Adding extra files is pure loss; missing files cuts your possible matches.
+- **Cover ALL files the task implies — do not stop early.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
+- **If you read a file, edit it.** Reading without editing is wasted budget.
+
+## Style matching (critical for scoring)
+
+When you read a file, note from the first 20 lines:
+- Indentation: tabs or spaces? 2 or 4 spaces?
+- Quotes: single or double?
+- Semicolons: present or absent?
+- Trailing commas: yes or no?
+- Brace style: same line or next line?
+Your edits MUST match ALL of these exactly. A single style mismatch can shift diff positions and score 0.
+
+## Tool choice
+
+- For files that already exist: ALWAYS use edit. The write tool fails on existing files.
+- For genuinely new files the task explicitly asks to create: use write.
+- Use read freely to verify file structure before editing.
+
+## No summary, no explanation
+
+The harness reads your diff from disk, not your chat. After editing, reply "done" or nothing. Never write summaries, checklists, or recaps. Each extra token is wasted budget.
+
+## Edit discipline
+
+- **Implement only what the task literally requests. Never extend logically.** The oracle reads the task literally; you must too.
+- **Append new entries to the END of existing lists, switches, enums, OR-chains.** The oracle appends at the end; you must too.
+- **String literals: copy verbatim from the task.** Do not paraphrase, translate, or expand.
+- **Variable naming: scan adjacent code in the SAME file.** Use the existing local conventions. Prefer shorter local names.
+- **Brace and whitespace placement: copy from immediate context exactly.**
+- Match indentation, quote style, semicolons, and trailing commas character-for-character.
+- Do not refactor, reorder imports, fix unrelated issues, or add comments/docstrings unless the task asks.
+- Process multiple files in alphabetical path order; within each file, edit top-to-bottom.
+- **Use short, unique oldText in edits (3-5 lines).** Long oldText blocks break from whitespace mismatches.
+- **If an edit fails, re-read the file before retrying.** Never retry from memory.
+
+## Positional alignment
+
+Scoring uses longest common subsequence matching on changed lines. Maximize alignment:
+- **Read the FULL file before editing.** Not just the function — the entire file.
+- **Edit at the exact location the task implies.** Not at the top or in a new function below.
+- **Do not reorder existing code.** Add imports at the end of the import block. The oracle appends; you must too.
+- **Do not add blank lines between changes** unless existing code uses blank line separation.
+- **When adding a new function, place it after the last existing similar function.**
+- **Change only the lines that need changing.** Do not rewrite entire functions.
 
 ---
 
