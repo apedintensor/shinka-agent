@@ -182,6 +182,13 @@ async function runLoop(
 	const stuckFilesAlerted = new Set<string>();
 	const EDIT_ERROR_THRESHOLD_PER_FILE = 3;
 
+	// tau/sn66 v22: time pressure + edit tracking (inspired by king TAO666-dev)
+	const loopStartTime = Date.now();
+	let hasEditedAnyFile = false;
+	let timeWarningInjected = false;
+	const TIME_WARNING_MS = 80_000; // warn at 80s if no edits
+	const HARD_EXIT_MS = 170_000; // exit at 170s to ensure diff captured before 180s timeout
+
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
 		let hasMoreToolCalls = true;
@@ -250,6 +257,41 @@ async function runLoop(
 				for (const result of toolResults) {
 					currentContext.messages.push(result);
 					newMessages.push(result);
+				}
+
+				// tau/sn66 v22: track successful edits + time pressure
+				for (let i = 0; i < toolResults.length; i++) {
+					const tc = toolCalls[i];
+					if (tc && tc.type === "toolCall" && (tc.name === "edit" || tc.name === "write")) {
+						const tr = toolResults[i];
+						if (tr && !tr.isError) {
+							hasEditedAnyFile = true;
+						}
+					}
+				}
+
+				const elapsed = Date.now() - loopStartTime;
+
+				// Hard exit before container timeout to ensure diff is captured
+				if (elapsed >= HARD_EXIT_MS) {
+					await emit({ type: "turn_end", message, toolResults });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				// Time warning: if 80s elapsed and no edits yet, nudge
+				if (!timeWarningInjected && !hasEditedAnyFile && elapsed >= TIME_WARNING_MS) {
+					timeWarningInjected = true;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "TIME WARNING: You have been running for over 80 seconds without producing an edit. You are running out of time. Pick the most relevant file NOW, read it if you haven't, and make your edit. Do not explore further — edit immediately.",
+							},
+						],
+						timestamp: Date.now(),
+					});
 				}
 
 				// tau/sn66 v15.2: track consecutive edit failures per file.
