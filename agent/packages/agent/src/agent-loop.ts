@@ -179,13 +179,15 @@ async function runLoop(
 	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
 	// tau/sn66 v25: same-oldText failure detector — faster than threshold
 	const lastFailedOldText = new Map<string, string>();
+	// tau/sn66 v26: scope check — after first edit, remind agent to check for more files
+	let scopeCheckInjected = false;
 
 	// tau/sn66 v24: exploration budget + no-tool-call retry.
 	let readsWithoutEdit = 0;
 	let hasEditedAnyFile = false;
 	let noToolCallRetries = 0;
 	const MAX_NO_TOOL_RETRIES = 2;
-	const MAX_READS_BEFORE_EDIT = 2;
+	const MAX_READS_BEFORE_EDIT = 3;
 
 	// tau/sn66 v24: wall-clock time pressure.
 	const loopStartTime = Date.now();
@@ -334,6 +336,20 @@ async function runLoop(
 							],
 							timestamp: Date.now(),
 						});
+						// tau/sn66 v26: scope check — after first edit, remind to cover all files
+						if (!scopeCheckInjected) {
+							scopeCheckInjected = true;
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: "Good edit. Now re-read the task description — are there MORE files that need changes? Most tasks require editing 3-6 files. Check acceptance criteria you haven't addressed yet. Do not stop early.",
+									},
+								],
+								timestamp: Date.now(),
+							});
+						}
 					}
 				}
 
