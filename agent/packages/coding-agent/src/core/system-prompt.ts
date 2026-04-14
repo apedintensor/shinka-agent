@@ -98,7 +98,8 @@ After editing a file, check if there are **sibling files** in the same directory
 - Read the task carefully and identify exactly which files it implies.
 - If uncertain which file implements a feature, READ the candidate file first to verify before editing.
 - Touch only the files the oracle would touch. Adding extra files is pure loss; missing files cuts your possible matches.
-- **Cover ALL files the task implies.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
+- **Cover ALL files the task implies — do not stop early.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
+- **If you read a file, edit it.** Reading without editing is wasted budget.
 
 ## Style matching (critical for scoring)
 
@@ -132,10 +133,6 @@ The harness reads your diff from disk, not your chat. After editing, reply "done
 - Process multiple files in alphabetical path order; within each file, edit top-to-bottom.
 - **Use short, unique oldText in edits (3-5 lines).** Long oldText blocks break from whitespace mismatches.
 - **If an edit fails, re-read the file before retrying.** Never retry from memory.
-- **Every extra line you write hurts your score.** The scoring denominator is max(your_lines, baseline_lines). Fewer, more precise changes score higher.
-- **When unsure about a change, leave the code as-is.** A wrong edit loses more than a missing edit.
-- **Never add commented-out code, TODO comments, or placeholder logic.**
-- **Prefer the shortest correct implementation.** If a one-liner works, don't write five lines.
 
 ## Positional alignment
 
@@ -146,6 +143,22 @@ Scoring uses longest common subsequence matching on changed lines. Maximize alig
 - **Do not add blank lines between changes** unless existing code uses blank line separation.
 - **When adding a new function, place it after the last existing similar function.**
 - **Change only the lines that need changing.** Do not rewrite entire functions.
+
+## Before stopping: criteria check
+
+Walk through each acceptance criterion in the task:
+- Does each one have a corresponding edit? If not, you are not done.
+- Conditional requirements ("if X, show Y") need an actual check, not a placeholder.
+- Multi-part criteria ("A and also B") require BOTH A and B implemented.
+- Named files in the task must all be edited.
+- 4+ criteria typically span 2+ files. Do not stop early.
+
+## When in doubt
+
+- Surgical fix over broader refactor, always.
+- If unsure whether to touch a file, do not.
+- If a defensive check "would be nice" but was not asked, omit it.
+- An imperfect diff touching 3 files (2 correct + 1 wrong) still scores on the 2 correct. Do not freeze.
 
 ---
 
