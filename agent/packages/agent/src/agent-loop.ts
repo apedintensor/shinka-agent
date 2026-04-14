@@ -182,17 +182,22 @@ async function runLoop(
 	// tau/sn66 v26: scope check — after first edit, remind agent to check for more files
 	let scopeCheckInjected = false;
 
-	// tau/sn66 v24: exploration budget + no-tool-call retry.
-	let readsWithoutEdit = 0;
+	// tau/sn66 v27: phase-based workflow (discover → read → edit)
+	let phase: "discover" | "read" | "edit" = "discover";
+	let discoveredFiles: string[] = [];
+	const readFiles = new Set<string>();
+	const filesReadPaths = new Set<string>();
 	let hasEditedAnyFile = false;
 	let noToolCallRetries = 0;
 	const MAX_NO_TOOL_RETRIES = 2;
-	const MAX_READS_BEFORE_EDIT = 3;
 
-	// tau/sn66 v24: wall-clock time pressure.
+	// tau/sn66 v27: escalating time pressure
 	const loopStartTime = Date.now();
 	let timeWarningInjected = false;
-	const TIME_WARNING_MS = 20_000; // early warning — short budgets can be 40-61s
+	let panicEditInjected = false;
+	let panicEditInjected2 = false;
+	const TIME_WARNING_MS = 8_000; // ultra early warning
+	const PANIC_EDIT_MS = 15_000; // first panic
 	const HARD_EXIT_MS = 170_000;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
@@ -324,7 +329,7 @@ async function runLoop(
 						editErrorsByFile.set(targetPath, 0);
 						lastFailedOldText.delete(targetPath);
 						hasEditedAnyFile = true;
-						readsWithoutEdit = 0;
+						phase = "edit";
 						// tau/sn66 v24: post-edit freshness — warn model that file changed
 						pendingMessages.push({
 							role: "user",
@@ -353,29 +358,57 @@ async function runLoop(
 					}
 				}
 
-				// tau/sn66 v24: track exploration budget — reads/bash without editing
-				for (const tr of toolResults) {
-					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
-						if (!hasEditedAnyFile) readsWithoutEdit++;
+				// tau/sn66 v27: phase-based workflow transitions
+				if (phase === "discover") {
+					for (const tr of toolResults) {
+						if (tr.toolName === "bash" && !tr.isError) {
+							const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
+							const paths = output.split("\n").filter((l: string) => l.trim().match(/\.\w+$/)).map((l: string) => l.trim());
+							if (paths.length > 0) {
+								discoveredFiles = paths.slice(0, 20);
+								phase = "read";
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: `Found ${discoveredFiles.length} files. Now READ each file you plan to edit — read ALL of them before making any edit:\n${discoveredFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
+									timestamp: Date.now(),
+								});
+							}
+						}
+					}
+				} else if (phase === "read") {
+					for (let ri = 0; ri < toolResults.length; ri++) {
+						const tr = toolResults[ri];
+						const tc = toolCalls[ri];
+						if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
+							const path = (tc.arguments as any)?.path ?? "";
+							if (path) readFiles.add(path);
+						}
+						if (tr.toolName === "edit" && !tr.isError) {
+							phase = "edit";
+						}
+					}
+					const readThreshold = Math.min(Math.max(3, discoveredFiles.length > 10 ? 6 : 3), 8);
+					if (readFiles.size >= readThreshold && phase === "read" && pendingMessages.length === 0) {
+						phase = "edit";
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `You have read ${readFiles.size} files. Call \`edit\` NOW on the first file. Do NOT write text or plans — call the edit tool directly. After editing, continue to the NEXT file until ALL acceptance criteria are covered.` }],
+							timestamp: Date.now(),
+						});
 					}
 				}
 
-				// Force edit after N reads without editing
-				if (!hasEditedAnyFile && readsWithoutEdit >= MAX_READS_BEFORE_EDIT && pendingMessages.length === 0) {
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "You have read enough files. Call `edit` on the most likely target file NOW. Do not read more files. One imperfect edit beats an empty diff.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					readsWithoutEdit = 0;
+				// tau/sn66 v27: track read file paths for panic edit context
+				for (let ri = 0; ri < toolResults.length; ri++) {
+					const tr = toolResults[ri];
+					const tc = toolCalls[ri];
+					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
+						const readPath = (tc.arguments as any)?.path;
+						if (readPath && typeof readPath === "string") filesReadPaths.add(readPath);
+					}
 				}
 
-				// tau/sn66 v25: ConnectionRefused detection — sandbox has no services
+				// tau/sn66 v25: ConnectionRefused detection
 				for (const tr of toolResults) {
 					if (tr.toolName === "bash" && !tr.isError) {
 						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
@@ -386,26 +419,41 @@ async function runLoop(
 					}
 				}
 
-				// tau/sn66 v24: hard exit before validator kills container
+				// tau/sn66 v27: hard exit before validator kills container
 				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
 					await emit({ type: "turn_end", message, toolResults });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
 
-				// tau/sn66 v24: time pressure — early warning at 20s
-				if (!hasEditedAnyFile && !timeWarningInjected && (Date.now() - loopStartTime) >= TIME_WARNING_MS && pendingMessages.length === 0) {
-					timeWarningInjected = true;
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "TIME WARNING: you have been running for over 20 seconds without producing an edit. The validator will kill this process soon. You MUST call `edit` or `write` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.",
-							},
-						],
-						timestamp: Date.now(),
-					});
+				// tau/sn66 v27: escalating panic edit
+				if (!hasEditedAnyFile && pendingMessages.length === 0) {
+					const elapsed = Date.now() - loopStartTime;
+					const filesList = filesReadPaths.size > 0
+						? `Files you have read: ${[...filesReadPaths].slice(0, 5).join(", ")}. `
+						: "";
+					if (!timeWarningInjected && elapsed >= TIME_WARNING_MS) {
+						timeWarningInjected = true;
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `TIME WARNING: ${Math.round(elapsed / 1000)}s elapsed with ZERO edits. The validator may kill this process soon. ${filesList}Call \`edit\` on the most relevant file NOW.` }],
+							timestamp: Date.now(),
+						});
+					} else if (!panicEditInjected && elapsed >= PANIC_EDIT_MS) {
+						panicEditInjected = true;
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `URGENT: ${Math.round(elapsed / 1000)}s elapsed with ZERO edits. An empty diff scores 0. ${filesList}Call \`edit\` NOW on the most relevant file. Even 1 correct line beats 0.` }],
+							timestamp: Date.now(),
+						});
+					} else if (panicEditInjected && !panicEditInjected2 && elapsed >= PANIC_EDIT_MS * 2) {
+						panicEditInjected2 = true;
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `FINAL WARNING: ${Math.round(elapsed / 1000)}s elapsed, STILL no edits. You are about to be killed. ${filesList}Make ANY edit RIGHT NOW or score 0.` }],
+							timestamp: Date.now(),
+						});
+					}
 				}
 			}
 
