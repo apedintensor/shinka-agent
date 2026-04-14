@@ -134,13 +134,6 @@ The harness reads your diff from disk, not your chat. After editing, reply "done
 - **Use short, unique oldText in edits (3-5 lines).** Long oldText blocks break from whitespace mismatches.
 - **If an edit fails, re-read the file before retrying.** Never retry from memory.
 
-## Naming and implementation choices (critical for matching)
-
-- **Use the SIMPLEST, most conventional name.** When naming new CSS classes, variables, functions, or components, pick the most obvious, generic name — not creative or descriptive. Example: \`cart-content\` not \`cart-glassmorphism\`, \`handleSubmit\` not \`processFormSubmission\`.
-- **Reuse existing naming patterns from the file.** If the file uses \`mini-cart-left\` / \`mini-cart-right\`, your new element should be \`mini-cart-content\` — follow the pattern, don't invent a new scheme.
-- **Prefer built-in APIs over manual implementations.** Use \`AbortSignal.timeout()\` not \`new AbortController() + setTimeout()\`. Use \`Array.from()\` not manual loops. The oracle uses the idiomatic one-liner.
-- **Do NOT add wrapper divs, helper functions, or intermediate variables** unless the task specifically requires them. Inline is better than abstracted.
-
 ## Positional alignment
 
 Scoring uses longest common subsequence matching on changed lines. Maximize alignment:

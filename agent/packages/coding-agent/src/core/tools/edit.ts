@@ -256,11 +256,23 @@ export function createEditToolDefinition(
 								}
 
 								const diffResult = generateDiffString(baseContent, newContent);
+
+								// tau/sn66 v030: style context feedback — help model match conventions
+								let styleHint = "";
+								try {
+									const lines = newContent.split("\n").slice(0, 30);
+									const useTabs = lines.some((l) => l.startsWith("\t"));
+									const indent = useTabs ? "tabs" : lines.some((l) => l.match(/^    /)) ? "4-space" : lines.some((l) => l.match(/^  \S/)) ? "2-space" : "unknown";
+									const quotes = newContent.includes("'") && !newContent.includes('"') ? "single" : newContent.includes('"') ? "double" : "unknown";
+									const semi = lines.filter((l) => l.trim().endsWith(";")).length > lines.filter((l) => l.trim().length > 3).length / 2 ? "yes" : "no";
+									styleHint = ` Style: ${indent} indent, ${quotes} quotes, semicolons=${semi}.`;
+								} catch {}
+
 								resolve({
 									content: [
 										{
 											type: "text",
-											text: `Successfully replaced ${edits.length} block(s) in ${path}.`,
+											text: `Successfully replaced ${edits.length} block(s) in ${path}.${styleHint} Match this style in subsequent edits.`,
 										},
 									],
 									details: { diff: diffResult.diff, firstChangedLine: diffResult.firstChangedLine },

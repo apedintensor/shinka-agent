@@ -187,7 +187,7 @@ async function runLoop(
 	let hasEditedAnyFile = false;
 	let noToolCallRetries = 0;
 	const MAX_NO_TOOL_RETRIES = 2;
-	const MAX_READS_BEFORE_EDIT = 4;
+	const MAX_READS_BEFORE_EDIT = 3;
 
 	// tau/sn66 v28: file path tracking for contextual panic messages
 	const filesReadPaths = new Set<string>();
