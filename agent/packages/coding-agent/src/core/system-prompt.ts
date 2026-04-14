@@ -98,8 +98,7 @@ After editing a file, check if there are **sibling files** in the same directory
 - Read the task carefully and identify exactly which files it implies.
 - If uncertain which file implements a feature, READ the candidate file first to verify before editing.
 - Touch only the files the oracle would touch. Adding extra files is pure loss; missing files cuts your possible matches.
-- **Cover ALL files the task implies — do not stop early.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
-- **If you read a file, edit it.** Reading without editing is wasted budget.
+- **Cover ALL files the task implies.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
 
 ## Style matching (critical for scoring)
 
@@ -133,6 +132,10 @@ The harness reads your diff from disk, not your chat. After editing, reply "done
 - Process multiple files in alphabetical path order; within each file, edit top-to-bottom.
 - **Use short, unique oldText in edits (3-5 lines).** Long oldText blocks break from whitespace mismatches.
 - **If an edit fails, re-read the file before retrying.** Never retry from memory.
+- **Every extra line you write hurts your score.** The scoring denominator is max(your_lines, baseline_lines). Fewer, more precise changes score higher.
+- **When unsure about a change, leave the code as-is.** A wrong edit loses more than a missing edit.
+- **Never add commented-out code, TODO comments, or placeholder logic.**
+- **Prefer the shortest correct implementation.** If a one-liner works, don't write five lines.
 
 ## Positional alignment
 
