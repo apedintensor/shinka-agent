@@ -6,12 +6,29 @@ import { execSync } from "node:child_process";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
-// tau/sn66 v25: pre-grep task keywords at prompt build time.
-// Extracts identifiers from the task description, greps the repo,
-// and injects matching file paths into the prompt. Saves 2-3 tool calls.
+// tau/sn66 v35: pre-grep task keywords + explicit path extraction.
+// Extracts literal file paths AND identifiers from the task description,
+// greps the repo, and injects matching file paths into the prompt.
 function grepTaskKeywords(cwd: string, taskText: string): string {
 	try {
 		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map((k) => k.replace(/`/g, "")) || [];
+
+		// v35: Extract explicit file paths from backtick-quoted strings
+		const explicitPaths = [...new Set(
+			backtickMatches.filter(
+				(k) =>
+					/[\\/]/.test(k) ||
+					/\.(ts|tsx|js|jsx|py|go|java|kt|rb|cs|vue|svelte|json|yaml|yml|rs|swift|php|gradle)$/i.test(k),
+			),
+		)].slice(0, 12);
+
+		let prefix = "";
+		if (explicitPaths.length > 0) {
+			prefix =
+				"\n\n## Paths named in the task\n\nRead these first (no extra discovery needed if the task is explicit):\n" +
+				explicitPaths.map((p) => `- \`${p}\`\n`).join("") +
+				"\n";
+		}
 		const camelMatches = taskText.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || [];
 		const snakeMatches = taskText.match(/\b[a-z]+_[a-z_]+\b/g) || [];
 		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches])]
@@ -23,7 +40,7 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 					),
 			)
 			.slice(0, 10);
-		if (allKeywords.length === 0) return "";
+		if (allKeywords.length === 0) return prefix;
 		const fileHits = new Map<string, string[]>();
 		for (const keyword of allKeywords) {
 			try {
@@ -41,13 +58,13 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 				}
 			} catch {}
 		}
-		if (fileHits.size === 0) return "";
+		if (fileHits.size === 0) return prefix;
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
 		let result = "\n\n## Files matching task keywords\n\nThese files contain identifiers from the task. Start here:\n";
 		for (const [file, keywords] of sorted) {
 			result += `- ${file} (${keywords.join(", ")})\n`;
 		}
-		return result + "\n";
+		return prefix + result + "\n";
 	} catch {}
 	return "";
 }
@@ -153,7 +170,12 @@ Walk through each acceptance criterion in the task:
 - Named files in the task must all be edited.
 - 4+ criteria typically span 2+ files. Do not stop early.
 
-## When in doubt
+## Priority (when instructions conflict)
+
+1. **Never ship an empty diff** — some correct lines beat zero.
+2. **Right files only** — touch files the task names or clearly implies; extra files are pure bloat.
+3. **Positional alignment** — same order, style, and minimal changed lines as the oracle would produce.
+4. **Full coverage** — every acceptance criterion, then stop.
 
 - Surgical fix over broader refactor, always.
 - If unsure whether to touch a file, do not.

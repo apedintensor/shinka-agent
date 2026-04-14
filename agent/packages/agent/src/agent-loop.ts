@@ -152,6 +152,37 @@ function createAgentStream(): EventStream<AgentEvent, AgentMessage[]> {
 /**
  * Main loop logic shared by agentLoop and agentLoopContinue.
  */
+/**
+ * Parse find/grep/ls output into likely repo-relative file paths.
+ * Infrastructure-level intelligence — compensates for model's weakness parsing CLI output.
+ */
+function extractCandidatePathsFromBashOutput(output: string, max = 24): string[] {
+	const paths: string[] = [];
+	const seen = new Set<string>();
+	for (const raw of output.split("\n")) {
+		let line = raw.trim();
+		if (!line || line.length > 280) continue;
+		if (/^(find:|grep:|bash:)/i.test(line)) continue;
+		if (line.startsWith("/usr/") || line.startsWith("/bin/") || line.startsWith("/etc/")) continue;
+		if (/^total \d+$/i.test(line)) continue;
+		line = line.replace(/^\.\/+/, "");
+		if (line.includes("node_modules") || line.includes(".git/") || line === ".git" || line.startsWith(".git")) continue;
+		const base = line.split("/").pop() ?? line;
+		const knownRootFiles = /^(dockerfile|makefile|license|readme\.md|\.gitignore|\.env)$/i.test(base);
+		const hasFileExt = /\.[A-Za-z0-9]{1,12}$/.test(line);
+		const pathLike =
+			/^[\w@./+,-]+$/.test(line) &&
+			line.length >= 2 &&
+			(line.includes("/") || hasFileExt || knownRootFiles);
+		if (!pathLike) continue;
+		if (seen.has(line)) continue;
+		seen.add(line);
+		paths.push(line);
+		if (paths.length >= max) break;
+	}
+	return paths;
+}
+
 async function runLoop(
 	currentContext: AgentContext,
 	newMessages: AgentMessage[],
@@ -352,6 +383,21 @@ async function runLoop(
 										text: "Good edit. Now re-read the task description — are there MORE files that need changes? Most tasks require editing 3-6 files. Check acceptance criteria you haven't addressed yet. Do not stop early.",
 									},
 								],
+								timestamp: Date.now(),
+							});
+						}
+					}
+				}
+
+				// tau/sn66 v35: extract file paths from bash output at harness level
+				for (const tr of toolResults) {
+					if (tr.toolName === "bash" && !tr.isError && !hasEditedAnyFile) {
+						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
+						const candidatePaths = extractCandidatePathsFromBashOutput(output);
+						if (candidatePaths.length > 0 && pendingMessages.length === 0) {
+							pendingMessages.push({
+								role: "user",
+								content: [{ type: "text", text: `Found ${candidatePaths.length} files. Read each one you plan to edit BEFORE making changes:\n${candidatePaths.slice(0, 12).map((p: string) => `- ${p}`).join("\n")}` }],
 								timestamp: Date.now(),
 							});
 						}
