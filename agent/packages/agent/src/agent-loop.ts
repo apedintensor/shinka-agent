@@ -171,16 +171,29 @@ async function runLoop(
 	// with 0 edits and produces an empty diff. With retry we inject a
 	// continuation prompt and try again.
 	let providerErrorRetries = 0;
-	const MAX_PROVIDER_ERROR_RETRIES = 3;
+	const MAX_PROVIDER_ERROR_RETRIES = 100;
 
-	// tau/sn66 v15.2: consecutive edit-error detector. Verified in local smoke
-	// test (smoke-batch-3): the model can hallucinate oldText and get stuck in
-	// a retry loop on a single file, burning the entire 300s budget on one
-	// file while leaving 12 other files in the task untouched. After N edit
-	// errors on the same file, force the model to move on.
+	// tau/sn66 v15.2: consecutive edit-error detector.
 	const editErrorsByFile = new Map<string, number>();
 	const stuckFilesAlerted = new Set<string>();
-	const EDIT_ERROR_THRESHOLD_PER_FILE = 3;
+	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
+	// tau/sn66 v25: same-oldText failure detector — faster than threshold
+	const lastFailedOldText = new Map<string, string>();
+	// tau/sn66 v26: scope check — after first edit, remind agent to check for more files
+	let scopeCheckInjected = false;
+
+	// tau/sn66 v24: exploration budget + no-tool-call retry.
+	let readsWithoutEdit = 0;
+	let hasEditedAnyFile = false;
+	let noToolCallRetries = 0;
+	const MAX_NO_TOOL_RETRIES = 2;
+	const MAX_READS_BEFORE_EDIT = 3;
+
+	// tau/sn66 v24: wall-clock time pressure.
+	const loopStartTime = Date.now();
+	let timeWarningInjected = false;
+	const TIME_WARNING_MS = 20_000; // early warning — short budgets can be 40-61s
+	const HARD_EXIT_MS = 170_000;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -239,9 +252,32 @@ async function runLoop(
 				return;
 			}
 
-			// Check for tool calls
+			// tau/sn66 v24: if model hit token limit or stopped without tool calls,
+			// inject retry. Catches Gemini Flash writing huge text without tool calls.
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
 			hasMoreToolCalls = toolCalls.length > 0;
+
+			if (!hasMoreToolCalls && noToolCallRetries < MAX_NO_TOOL_RETRIES) {
+				const isLength = message.stopReason === "length";
+				const isStopNoEdit = message.stopReason === "stop" && !hasEditedAnyFile;
+				if (isLength || isStopNoEdit) {
+					noToolCallRetries++;
+					await emit({ type: "turn_end", message, toolResults: [] });
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: isLength
+									? "You hit the token limit without making any tool call. Do NOT write text. Call `read` or `edit` directly. One read + one edit = minimum unit of work."
+									: "You stopped without editing any file. An empty diff loses. Call `read` on the most likely target file, then `edit` it. Do it now.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					continue;
+				}
+			}
 
 			const toolResults: ToolResultMessage[] = [];
 			if (hasMoreToolCalls) {
@@ -253,8 +289,6 @@ async function runLoop(
 				}
 
 				// tau/sn66 v15.2: track consecutive edit failures per file.
-				// When the same file accumulates >= threshold edit errors,
-				// inject a steering message to force the model off that file.
 				for (let i = 0; i < toolResults.length; i++) {
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
@@ -265,6 +299,13 @@ async function runLoop(
 					if (tr.isError) {
 						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
 						editErrorsByFile.set(targetPath, next);
+						// tau/sn66 v25: same-oldText detector — catch repeated failures faster
+						const editOldText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
+						const prevFailed = lastFailedOldText.get(targetPath);
+						if (editOldText && prevFailed === editOldText && pendingMessages.length === 0) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit on \`${targetPath}\` failed with SAME oldText twice. Call \`read\` on it NOW, then retry.` }], timestamp: Date.now() });
+						}
+						lastFailedOldText.set(targetPath, editOldText);
 						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
 							stuckFilesAlerted.add(targetPath);
 							pendingMessages.push({
@@ -279,9 +320,92 @@ async function runLoop(
 							});
 						}
 					} else {
-						// Successful edit on this file resets its error counter.
+						// Successful edit resets error counter + triggers freshness warning
 						editErrorsByFile.set(targetPath, 0);
+						lastFailedOldText.delete(targetPath);
+						hasEditedAnyFile = true;
+						readsWithoutEdit = 0;
+						// tau/sn66 v24: post-edit freshness — warn model that file changed
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `\`${targetPath}\` was modified by your edit. If you need to edit this file again, call \`read\` on it first to see the current content. Do NOT use oldText from memory — it is now stale.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+						// tau/sn66 v26: scope check — after first edit, remind to cover all files
+						if (!scopeCheckInjected) {
+							scopeCheckInjected = true;
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: "Good edit. Now re-read the task description — are there MORE files that need changes? Most tasks require editing 3-6 files. Check acceptance criteria you haven't addressed yet. Do not stop early.",
+									},
+								],
+								timestamp: Date.now(),
+							});
+						}
 					}
+				}
+
+				// tau/sn66 v24: track exploration budget — reads/bash without editing
+				for (const tr of toolResults) {
+					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
+						if (!hasEditedAnyFile) readsWithoutEdit++;
+					}
+				}
+
+				// Force edit after N reads without editing
+				if (!hasEditedAnyFile && readsWithoutEdit >= MAX_READS_BEFORE_EDIT && pendingMessages.length === 0) {
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "You have read enough files. Call `edit` on the most likely target file NOW. Do not read more files. One imperfect edit beats an empty diff.",
+							},
+						],
+						timestamp: Date.now(),
+					});
+					readsWithoutEdit = 0;
+				}
+
+				// tau/sn66 v25: ConnectionRefused detection — sandbox has no services
+				for (const tr of toolResults) {
+					if (tr.toolName === "bash" && !tr.isError) {
+						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
+						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: "STOP: Sandbox has NO services. Do NOT retry connections. Call `read` or `edit` NOW." }], timestamp: Date.now() });
+							break;
+						}
+					}
+				}
+
+				// tau/sn66 v24: hard exit before validator kills container
+				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
+					await emit({ type: "turn_end", message, toolResults });
+					await emit({ type: "agent_end", messages: newMessages });
+					return;
+				}
+
+				// tau/sn66 v24: time pressure — early warning at 20s
+				if (!hasEditedAnyFile && !timeWarningInjected && (Date.now() - loopStartTime) >= TIME_WARNING_MS && pendingMessages.length === 0) {
+					timeWarningInjected = true;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "TIME WARNING: you have been running for over 20 seconds without producing an edit. The validator will kill this process soon. You MUST call `edit` or `write` on a file RIGHT NOW or you will score 0. Pick the single most obvious target file from the task and edit it immediately. Do not read any more files.",
+							},
+						],
+						timestamp: Date.now(),
+					});
 				}
 			}
 
