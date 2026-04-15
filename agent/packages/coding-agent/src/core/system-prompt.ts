@@ -3,6 +3,8 @@
  */
 
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import nodePath from "node:path";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
@@ -60,9 +62,40 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 		}
 		if (fileHits.size === 0) return prefix;
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
-		let result = "\n\n## Files matching task keywords\n\nThese files contain identifiers from the task. Start here:\n";
+
+		// v36: Extract symbols from top files to give the model structural understanding
+		const defPatterns: Record<string, RegExp[]> = {
+			ts: [/^(?:export\s+)?(?:async\s+)?function\s+(\w+)/, /^(?:export\s+)?class\s+(\w+)/, /^(?:export\s+)?interface\s+(\w+)/, /^(?:export\s+)?type\s+(\w+)\s*=/, /^(?:export\s+)?const\s+(\w+)\s*[:=]/],
+			py: [/^\s*def\s+(\w+)\s*\(/, /^\s*class\s+(\w+)/],
+			go: [/^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(/, /^type\s+(\w+)\s+(?:struct|interface)/],
+			java: [/^\s*(?:public|private|protected)?\s*(?:static\s+)?class\s+(\w+)/, /^\s*(?:public|private|protected)?\s*\w+\s+(\w+)\s*\(/],
+		};
+		const extMap: Record<string, string> = { ".ts": "ts", ".tsx": "ts", ".js": "ts", ".jsx": "ts", ".py": "py", ".go": "go", ".java": "java", ".kt": "java", ".vue": "ts" };
+		const skip = new Set(["if", "else", "for", "while", "return", "switch", "case", "try", "catch", "new", "this", "super", "constructor"]);
+
+		let result = "\n\n## Files matching task keywords (with structure)\n\n";
 		for (const [file, keywords] of sorted) {
-			result += `- ${file} (${keywords.join(", ")})\n`;
+			let symbolStr = "";
+			try {
+				const fullPath = nodePath.resolve(cwd, file);
+				const ext = nodePath.extname(file);
+				const lang = extMap[ext];
+				if (lang && defPatterns[lang]) {
+					const content = readFileSync(fullPath, "utf-8");
+					const symbols: string[] = [];
+					for (const line of content.split("\n")) {
+						for (const p of defPatterns[lang]) {
+							const m = line.match(p);
+							if (m && m[1] && !skip.has(m[1]) && symbols.length < 8) {
+								symbols.push(m[1]);
+								break;
+							}
+						}
+					}
+					if (symbols.length > 0) symbolStr = ` → defines: ${symbols.join(", ")}`;
+				}
+			} catch {}
+			result += `- ${file} (${keywords.join(", ")})${symbolStr}\n`;
 		}
 		return prefix + result + "\n";
 	} catch {}
