@@ -204,32 +204,38 @@ async function runLoop(
 	let providerErrorRetries = 0;
 	const MAX_PROVIDER_ERROR_RETRIES = 100;
 
-	// tau/sn66 v15.2: consecutive edit-error detector.
-	const editErrorsByFile = new Map<string, number>();
-	const stuckFilesAlerted = new Set<string>();
-	const EDIT_ERROR_THRESHOLD_PER_FILE = 2;
-	// tau/sn66 v25: same-oldText failure detector — faster than threshold
-	const lastFailedOldText = new Map<string, string>();
-	// tau/sn66 v26: scope check — after first edit, remind agent to check for more files
-	let scopeCheckInjected = false;
+	// v037: edit failure tracking
+	const editFailMap = new Map<string, number>();
+	const failNotified = new Set<string>();
+	const EDIT_FAIL_CEILING = 2;
+	const priorFailedAnchor = new Map<string, string>();
 
-	// tau/sn66 v24: exploration budget + no-tool-call retry.
-	let readsWithoutEdit = 0;
-	let hasEditedAnyFile = false;
-	let noToolCallRetries = 0;
-	const MAX_NO_TOOL_RETRIES = 2;
-	const MAX_READS_BEFORE_EDIT = 3;
+	// v037: exploration + no-tool-call retry
+	let explorationCount = 0;
+	let hasProducedEdit = false;
+	let emptyTurnRetries = 0;
+	const EMPTY_TURN_MAX = 2;
 
-	// tau/sn66 v28: file path tracking for contextual panic messages
-	const filesReadPaths = new Set<string>();
+	// v037: file path tracking + per-file read counts
+	const loopStart = Date.now();
+	let earlyNudgeSent = false;
+	let urgentNudgeSent = false;
+	let finalNudgeSent = false;
+	const pathsAlreadyRead = new Set<string>();
+	const pathReadCounts = new Map<string, number>();
+	let rereadNudgeSent = false;
+	const editedPaths = new Set<string>();
 
-	// tau/sn66 v28: escalating time pressure (v026 base + v054 panic)
-	const loopStartTime = Date.now();
-	let timeWarningInjected = false;
-	let panicEditInjected = false;
-	const TIME_WARNING_MS = 20_000;
-	const PANIC_EDIT_MS = 40_000;
-	const HARD_EXIT_MS = 170_000;
+	// v037: work phase state machine (from storm)
+	let workPhase: "search" | "absorb" | "apply" = "search";
+	let foundFiles: string[] = [];
+	let absorbedFiles = new Set<string>();
+	const EARLY_NUDGE_MS = 10_000;
+	const URGENT_NUDGE_MS = 22_000;
+	const LATE_NUDGE_MS = 55_000;
+	const GRACEFUL_EXIT_MS = 170_000;
+	let multiFileHintSent = false;
+	let reviewPassDone = false;
 
 	// Outer loop: continues when queued follow-up messages arrive after agent would stop
 	while (true) {
@@ -288,25 +294,29 @@ async function runLoop(
 				return;
 			}
 
-			// tau/sn66 v24: if model hit token limit or stopped without tool calls,
-			// inject retry. Catches Gemini Flash writing huge text without tool calls.
 			const toolCalls = message.content.filter((c) => c.type === "toolCall");
+			// v037: fix EditEdits hallucination
+			for (const tc of toolCalls) {
+				if (tc.type === "toolCall" && (tc.name === "EditEdits" || tc.name === "editEdits")) {
+					tc.name = "edit";
+				}
+			}
 			hasMoreToolCalls = toolCalls.length > 0;
 
-			if (!hasMoreToolCalls && noToolCallRetries < MAX_NO_TOOL_RETRIES) {
-				const isLength = message.stopReason === "length";
-				const isStopNoEdit = message.stopReason === "stop" && !hasEditedAnyFile;
-				if (isLength || isStopNoEdit) {
-					noToolCallRetries++;
+			if (!hasMoreToolCalls && emptyTurnRetries < EMPTY_TURN_MAX) {
+				const tokenCapped = message.stopReason === "length";
+				const idleStopped = message.stopReason === "stop" && !hasProducedEdit;
+				if (tokenCapped || idleStopped) {
+					emptyTurnRetries++;
 					await emit({ type: "turn_end", message, toolResults: [] });
 					pendingMessages.push({
 						role: "user",
 						content: [
 							{
 								type: "text",
-								text: isLength
-									? "You hit the token limit without making any tool call. Do NOT write text. Call `read` or `edit` directly. One read + one edit = minimum unit of work."
-									: "You stopped without editing any file. An empty diff loses. Call `read` on the most likely target file, then `edit` it. Do it now.",
+								text: tokenCapped
+									? "Output budget consumed without any tool invocation. Invoke `read` or `edit` now. Text output contributes nothing to your score."
+									: "No file modifications detected. A blank diff receives zero points. Use `read` on the primary file, then `edit` it immediately.",
 							},
 						],
 						timestamp: Date.now(),
@@ -324,7 +334,7 @@ async function runLoop(
 					newMessages.push(result);
 				}
 
-				// tau/sn66 v15.2: track consecutive edit failures per file.
+				// v037: track edit failures + successful edits with breadth hints
 				for (let i = 0; i < toolResults.length; i++) {
 					const tr = toolResults[i];
 					const tc = toolCalls[i];
@@ -333,54 +343,63 @@ async function runLoop(
 					const targetPath = (tc.arguments as { path?: string } | undefined)?.path;
 					if (!targetPath || typeof targetPath !== "string") continue;
 					if (tr.isError) {
-						const next = (editErrorsByFile.get(targetPath) ?? 0) + 1;
-						editErrorsByFile.set(targetPath, next);
-						// tau/sn66 v25: same-oldText detector — catch repeated failures faster
-						const editOldText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
-						const prevFailed = lastFailedOldText.get(targetPath);
-						if (editOldText && prevFailed === editOldText && pendingMessages.length === 0) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Edit on \`${targetPath}\` failed with SAME oldText twice. Call \`read\` on it NOW, then retry.` }], timestamp: Date.now() });
+						const count = (editFailMap.get(targetPath) ?? 0) + 1;
+						editFailMap.set(targetPath, count);
+						const anchorText = (tc.arguments as any)?.old_string ?? (tc.arguments as any)?.oldText ?? "";
+						const prevAnchor = priorFailedAnchor.get(targetPath);
+						if (anchorText && prevAnchor === anchorText && pendingMessages.length === 0) {
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: `Identical oldText failed twice on \`${targetPath}\`. Use \`read\` to get fresh contents before retrying.` }], timestamp: Date.now() });
 						}
-						lastFailedOldText.set(targetPath, editOldText);
-						if (next >= EDIT_ERROR_THRESHOLD_PER_FILE && !stuckFilesAlerted.has(targetPath)) {
-							stuckFilesAlerted.add(targetPath);
+						priorFailedAnchor.set(targetPath, anchorText);
+						if (count >= EDIT_FAIL_CEILING && !failNotified.has(targetPath)) {
+							failNotified.add(targetPath);
 							pendingMessages.push({
 								role: "user",
 								content: [
 									{
 										type: "text",
-										text: `STOP editing \`${targetPath}\`. You have failed ${next} edit attempts on this file in a row, all with "Could not find oldText" errors. The model's mental copy of this file is wrong. Do ONE of the following NOW:\n\n1. Move on to a DIFFERENT file in the task — there are likely other files mentioned in the acceptance criteria you haven't touched yet.\n2. If you must keep editing this file, call \`read\` on it ONE MORE TIME to refresh your view, then make ONE small edit with a very short, unique oldText snippet (5-10 lines max). Do not paste large blocks.\n3. Never paste text you remember — only paste text you have JUST read in this session.\n\nDo not retry the failed edits. Move on.`,
+										text: `Edit attempts on \`${targetPath}\` have failed ${count} times. Your cached view is stale. Options:\n\n1. Switch to another file from the acceptance criteria you have not edited yet.\n2. Call \`read\` on this file to refresh, then use a compact oldText anchor (under 5 lines).\n3. Only use text you have just read — never paste from memory.`,
 									},
 								],
 								timestamp: Date.now(),
 							});
 						}
 					} else {
-						// Successful edit resets error counter + triggers freshness warning
-						editErrorsByFile.set(targetPath, 0);
-						lastFailedOldText.delete(targetPath);
-						hasEditedAnyFile = true;
-						readsWithoutEdit = 0;
-						// tau/sn66 v24: post-edit freshness — warn model that file changed
+						editFailMap.set(targetPath, 0);
+						priorFailedAnchor.delete(targetPath);
+						const firstEdit = !hasProducedEdit;
+						hasProducedEdit = true;
+						explorationCount = 0;
+						editedPaths.add(targetPath);
+						// v037: breadth hint — list unedited files from discovery
+						const uneditedTargets = foundFiles.filter(
+							(f: string) => !editedPaths.has(f) && !editedPaths.has("./" + f) && !editedPaths.has(f.replace(/^\.\//, ""))
+						);
+						const breadthHint = uneditedTargets.length > 0
+							? ` There are still ${uneditedTargets.length} discovered target file(s) you have not edited: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Continue with the next file.`
+							: "";
 						pendingMessages.push({
 							role: "user",
 							content: [
 								{
 									type: "text",
-									text: `\`${targetPath}\` was modified by your edit. If you need to edit this file again, call \`read\` on it first to see the current content. Do NOT use oldText from memory — it is now stale.`,
+									text: `\`${targetPath}\` updated successfully.${breadthHint} Does this change fully satisfy the relevant acceptance criterion?`,
 								},
 							],
 							timestamp: Date.now(),
 						});
-						// tau/sn66 v26: scope check — after first edit, remind to cover all files
-						if (!scopeCheckInjected) {
-							scopeCheckInjected = true;
+						if (
+							firstEdit &&
+							!multiFileHintSent &&
+							(foundFiles.length >= 4 || pathsAlreadyRead.size >= 4)
+						) {
+							multiFileHintSent = true;
 							pendingMessages.push({
 								role: "user",
 								content: [
 									{
 										type: "text",
-										text: "Good edit. Now re-read the task description — are there MORE files that need changes? Most tasks require editing 3-6 files. Check acceptance criteria you haven't addressed yet. Do not stop early.",
+										text: "You touched several candidate paths. If any acceptance criterion still maps to a file you have not edited, continue there before stopping — ties favor complete coverage.",
 									},
 								],
 								timestamp: Date.now(),
@@ -389,92 +408,171 @@ async function runLoop(
 					}
 				}
 
-				// tau/sn66 v35: extract file paths from bash output at harness level
-				for (const tr of toolResults) {
-					if (tr.toolName === "bash" && !tr.isError && !hasEditedAnyFile) {
-						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
-						const candidatePaths = extractCandidatePathsFromBashOutput(output);
-						if (candidatePaths.length > 0 && pendingMessages.length === 0) {
-							pendingMessages.push({
-								role: "user",
-								content: [{ type: "text", text: `Found ${candidatePaths.length} files. Read each one you plan to edit BEFORE making changes:\n${candidatePaths.slice(0, 12).map((p: string) => `- ${p}`).join("\n")}` }],
-								timestamp: Date.now(),
-							});
-						}
-					}
-				}
-
-				// tau/sn66 v24: track exploration budget — reads/bash without editing
-				for (const tr of toolResults) {
-					if ((tr.toolName === "read" || tr.toolName === "bash") && !tr.isError) {
-						if (!hasEditedAnyFile) readsWithoutEdit++;
-					}
-				}
-
-				// Force edit after N reads without editing
-				if (!hasEditedAnyFile && readsWithoutEdit >= MAX_READS_BEFORE_EDIT && pendingMessages.length === 0) {
-					pendingMessages.push({
-						role: "user",
-						content: [
-							{
-								type: "text",
-								text: "You have read enough files. Call `edit` on the most likely target file NOW. Do not read more files. One imperfect edit beats an empty diff.",
-							},
-						],
-						timestamp: Date.now(),
-					});
-					readsWithoutEdit = 0;
-				}
-
-				// tau/sn66 v28: track read file paths for contextual panic
-				for (let ri = 0; ri < toolResults.length; ri++) {
-					const tr = toolResults[ri];
-					const tc = toolCalls[ri];
-					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
-						const readPath = (tc.arguments as any)?.path;
-						if (readPath && typeof readPath === "string") filesReadPaths.add(readPath);
-					}
-				}
-
-				// tau/sn66 v25: ConnectionRefused detection — sandbox has no services
+				// v037: ConnectionRefused detection
 				for (const tr of toolResults) {
 					if (tr.toolName === "bash" && !tr.isError) {
-						const output = tr.content?.map((c: any) => (c as any).text ?? "").join("") ?? "";
+						const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
 						if (output.includes("ConnectionRefusedError") || output.includes("Connection refused") || output.includes("ECONNREFUSED")) {
-							pendingMessages.push({ role: "user", content: [{ type: "text", text: "STOP: Sandbox has NO services. Do NOT retry connections. Call `read` or `edit` NOW." }], timestamp: Date.now() });
+							pendingMessages.push({ role: "user", content: [{ type: "text", text: "No services available in this environment. All network requests will fail. Proceed with `read` and `edit` only." }], timestamp: Date.now() });
 							break;
 						}
 					}
 				}
 
-				// tau/sn66 v24: hard exit before validator kills container
-				if ((Date.now() - loopStartTime) >= HARD_EXIT_MS) {
+				// v037: work phase state machine
+				if (workPhase === "search") {
+					for (const tr of toolResults) {
+						if (tr.toolName === "bash" && !tr.isError) {
+							const output = tr.content?.map((c: any) => c.text ?? "").join("") ?? "";
+							const paths = extractCandidatePathsFromBashOutput(output, 24);
+							if (paths.length > 0) {
+								foundFiles = paths.slice(0, 20);
+								workPhase = "absorb";
+								pendingMessages.push({
+									role: "user",
+									content: [{ type: "text", text: `Located ${foundFiles.length} candidate files. Read each file you intend to modify before making any edit:\n${foundFiles.slice(0, 10).map((p: string) => `- ${p}`).join("\n")}` }],
+									timestamp: Date.now(),
+								});
+							}
+						}
+					}
+				} else if (workPhase === "absorb") {
+					for (const tr of toolResults) {
+						if (tr.toolName === "read" && !tr.isError) {
+							const tc2 = toolCalls.find((c: any) => c.type === "toolCall" && c.name === "read");
+							if (tc2) {
+								const rpath = (tc2.arguments as any)?.path ?? "";
+								if (rpath) absorbedFiles.add(rpath);
+							}
+						}
+						if (tr.toolName === "edit" && !tr.isError) {
+							workPhase = "apply";
+						}
+					}
+					const absorbLimit = Math.min(Math.max(3, foundFiles.length > 10 ? 6 : 3), 8);
+					if (absorbedFiles.size >= absorbLimit && workPhase === "absorb" && pendingMessages.length === 0) {
+						workPhase = "apply";
+						pendingMessages.push({
+							role: "user",
+							content: [{ type: "text", text: `${absorbedFiles.size} files absorbed. Begin editing the first target file now — invoke \`edit\` directly. Proceed through remaining files until every acceptance criterion is covered.` }],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
+				// v037: track reads + per-file read counts
+				for (let ri = 0; ri < toolResults.length; ri++) {
+					const tr = toolResults[ri];
+					const tc = toolCalls[ri];
+					if (tr.toolName === "read" && !tr.isError) {
+						if (!hasProducedEdit) explorationCount++;
+					}
+					if (tr.toolName === "read" && !tr.isError && tc && tc.type === "toolCall") {
+						const readPath = (tc.arguments as any)?.path;
+						if (readPath && typeof readPath === "string") {
+							pathsAlreadyRead.add(readPath);
+							pathReadCounts.set(readPath, (pathReadCounts.get(readPath) ?? 0) + 1);
+						}
+					}
+				}
+
+				// v037: per-file re-read detection (warn at 4+)
+				if (!rereadNudgeSent && pendingMessages.length === 0) {
+					for (const [rp, cnt] of pathReadCounts) {
+						if (cnt >= 4) {
+							rereadNudgeSent = true;
+							const others = foundFiles.filter(
+								(f: string) => !editedPaths.has(f) && f !== rp && !f.endsWith("/" + rp) && !rp.endsWith("/" + f)
+							);
+							pendingMessages.push({
+								role: "user",
+								content: [
+									{
+										type: "text",
+										text: `You have read \`${rp}\` ${cnt} times. Stop re-reading it. ${others.length > 0 ? `Move to a different file you have not edited yet: ${others.slice(0, 4).map((f: string) => `\`${f}\``).join(", ")}.` : "Apply `edit` now or move on."}`,
+									},
+								],
+								timestamp: Date.now(),
+							});
+							break;
+						}
+					}
+				}
+
+				// v037: dynamic exploration ceiling
+				const dynamicExploreCeiling = Math.max(3, Math.min(foundFiles.length + 1, 8));
+				if (!hasProducedEdit && explorationCount >= dynamicExploreCeiling && pendingMessages.length === 0) {
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: `Context gathered (${explorationCount} reads/bashes). Apply your first edit to the highest-priority target file now. A partial patch always outscores an empty diff.`,
+							},
+						],
+						timestamp: Date.now(),
+					});
+					explorationCount = 0;
+				}
+
+				// v037: 3-tier time pressure (10s / 22s / 55s)
+				if (!hasProducedEdit && pendingMessages.length === 0) {
+					const elapsed = Date.now() - loopStart;
+					const readList = pathsAlreadyRead.size > 0
+						? `Previously read: ${[...pathsAlreadyRead].slice(0, 5).join(", ")}. `
+						: "";
+					if (!earlyNudgeSent && elapsed >= EARLY_NUDGE_MS) {
+						earlyNudgeSent = true;
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `${Math.round(elapsed/1000)}s elapsed without any edits. An empty diff scores zero. ${readList}Apply \`edit\` to the most relevant file now. Even one correct change contributes to your score.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					} else if (earlyNudgeSent && elapsed >= URGENT_NUDGE_MS && !urgentNudgeSent) {
+						urgentNudgeSent = true;
+						pendingMessages.push({
+							role: "user",
+							content: [
+								{
+									type: "text",
+									text: `${Math.round(elapsed/1000)}s in with zero file modifications. Time may be running out. ${readList}Make an edit immediately or accept a zero score.`,
+								},
+							],
+							timestamp: Date.now(),
+						});
+					}
+				}
+
+				// v037: graceful exit
+				if ((Date.now() - loopStart) >= GRACEFUL_EXIT_MS) {
 					await emit({ type: "turn_end", message, toolResults });
 					await emit({ type: "agent_end", messages: newMessages });
 					return;
 				}
 
-				// tau/sn66 v28: escalating time pressure with file context
-				if (!hasEditedAnyFile && pendingMessages.length === 0) {
-					const elapsed = Date.now() - loopStartTime;
-					const filesList = filesReadPaths.size > 0
-						? `Files you've read: ${[...filesReadPaths].slice(0, 5).join(", ")}. `
-						: "";
-					if (!timeWarningInjected && elapsed >= TIME_WARNING_MS) {
-						timeWarningInjected = true;
-						pendingMessages.push({
-							role: "user",
-							content: [{ type: "text", text: `TIME WARNING: ${Math.round(elapsed / 1000)}s elapsed with ZERO edits. ${filesList}Start editing the most relevant file NOW.` }],
-							timestamp: Date.now(),
-						});
-					} else if (!panicEditInjected && elapsed >= PANIC_EDIT_MS) {
-						panicEditInjected = true;
-						pendingMessages.push({
-							role: "user",
-							content: [{ type: "text", text: `URGENT: ${Math.round(elapsed / 1000)}s elapsed, STILL no edits. An empty diff scores 0. ${filesList}Call \`edit\` NOW. Even 1 correct line beats nothing.` }],
-							timestamp: Date.now(),
-						});
-					}
+				// v037: final nudge at 55s
+				if (
+					!hasProducedEdit &&
+					!finalNudgeSent &&
+					(Date.now() - loopStart) >= LATE_NUDGE_MS &&
+					pendingMessages.length === 0
+				) {
+					finalNudgeSent = true;
+					pendingMessages.push({
+						role: "user",
+						content: [
+							{
+								type: "text",
+								text: "Over 50s without edits. Pick the clearest file from the task or keyword list and apply `edit` now — further discovery has diminishing returns.",
+							},
+						],
+						timestamp: Date.now(),
+					});
 				}
 			}
 
@@ -486,8 +584,26 @@ async function runLoop(
 		// Agent would stop here. Check for follow-up messages.
 		const followUpMessages = (await config.getFollowUpMessages?.()) || [];
 		if (followUpMessages.length > 0) {
-			// Set as pending so inner loop processes them
 			pendingMessages = followUpMessages;
+			continue;
+		}
+
+		// v037: criteria review — one second pass if time allows
+		const reviewElapsed = Date.now() - loopStart;
+		if (!reviewPassDone && hasProducedEdit && reviewElapsed < 60_000) {
+			reviewPassDone = true;
+			workPhase = "search";
+			const uneditedTargets = foundFiles.filter(
+				(f: string) => !editedPaths.has(f) && !editedPaths.has("./" + f) && !editedPaths.has(f.replace(/^\.\//, ""))
+			);
+			const hint = uneditedTargets.length > 0
+				? `Unedited discovered files: ${uneditedTargets.slice(0, 5).map((f: string) => `\`${f}\``).join(", ")}. Read and edit them.`
+				: `Re-read the task acceptance criteria. Are there files or criteria you missed? If yes, discover and edit them. If all criteria are covered, reply "done".`;
+			pendingMessages = [{
+				role: "user",
+				content: [{ type: "text", text: `REVIEW: You edited ${editedPaths.size} file(s): ${[...editedPaths].join(", ")}. ${hint}` }],
+				timestamp: Date.now(),
+			}];
 			continue;
 		}
 

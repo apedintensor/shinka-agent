@@ -3,14 +3,23 @@
  */
 
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import nodePath from "node:path";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
-// tau/sn66 v35: pre-grep task keywords + explicit path extraction.
-// Extracts literal file paths AND identifiers from the task description,
-// greps the repo, and injects matching file paths into the prompt.
+// v037: count acceptance criteria bullets for scope analysis
+function countAcceptanceCriteria(taskText: string): number {
+	const criteriaSection = taskText.match(/(?:acceptance\s+criteria|requirements):?\s*\n([\s\S]*?)(?:\n\n|\n(?=[A-Z])|\n(?=##)|$)/i);
+	if (!criteriaSection) return 0;
+	const bullets = criteriaSection[1].match(/^\s*[-*•]\s+/gm);
+	return bullets ? bullets.length : 0;
+}
+
+// v037: extract explicitly named files from task
+function extractNamedFiles(taskText: string): string[] {
+	const filePatterns = taskText.match(/`([^`]+\.[a-zA-Z]{1,6})`/g) || [];
+	return [...new Set(filePatterns.map(f => f.replace(/`/g, '')))];
+}
+
 function grepTaskKeywords(cwd: string, taskText: string): string {
 	try {
 		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map((k) => k.replace(/`/g, "")) || [];
@@ -63,41 +72,35 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 		if (fileHits.size === 0) return prefix;
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
 
-		// v36: Extract symbols from top files to give the model structural understanding
-		const defPatterns: Record<string, RegExp[]> = {
-			ts: [/^(?:export\s+)?(?:async\s+)?function\s+(\w+)/, /^(?:export\s+)?class\s+(\w+)/, /^(?:export\s+)?interface\s+(\w+)/, /^(?:export\s+)?type\s+(\w+)\s*=/, /^(?:export\s+)?const\s+(\w+)\s*[:=]/],
-			py: [/^\s*def\s+(\w+)\s*\(/, /^\s*class\s+(\w+)/],
-			go: [/^func\s+(?:\([^)]+\)\s+)?(\w+)\s*\(/, /^type\s+(\w+)\s+(?:struct|interface)/],
-			java: [/^\s*(?:public|private|protected)?\s*(?:static\s+)?class\s+(\w+)/, /^\s*(?:public|private|protected)?\s*\w+\s+(\w+)\s*\(/],
-		};
-		const extMap: Record<string, string> = { ".ts": "ts", ".tsx": "ts", ".js": "ts", ".jsx": "ts", ".py": "py", ".go": "go", ".java": "java", ".kt": "java", ".vue": "ts" };
-		const skip = new Set(["if", "else", "for", "while", "return", "switch", "case", "try", "catch", "new", "this", "super", "constructor"]);
+		// v037: scope analysis — criteria count + named files
+		const criteriaCount = countAcceptanceCriteria(taskText);
+		const namedFiles = extractNamedFiles(taskText);
 
-		let result = "\n\n## Files matching task keywords (with structure)\n\n";
-		for (const [file, keywords] of sorted) {
-			let symbolStr = "";
-			try {
-				const fullPath = nodePath.resolve(cwd, file);
-				const ext = nodePath.extname(file);
-				const lang = extMap[ext];
-				if (lang && defPatterns[lang]) {
-					const content = readFileSync(fullPath, "utf-8");
-					const symbols: string[] = [];
-					for (const line of content.split("\n")) {
-						for (const p of defPatterns[lang]) {
-							const m = line.match(p);
-							if (m && m[1] && !skip.has(m[1]) && symbols.length < 8) {
-								symbols.push(m[1]);
-								break;
-							}
-						}
-					}
-					if (symbols.length > 0) symbolStr = ` → defines: ${symbols.join(", ")}`;
+		let result = "";
+		if (criteriaCount > 0 || namedFiles.length > 0) {
+			result += "\n\n## Task scope analysis\n\n";
+			if (criteriaCount > 0) {
+				result += `This task has **${criteriaCount} acceptance criteria**. `;
+				if (criteriaCount >= 3) {
+					result += `Tasks with ${criteriaCount}+ criteria almost always require edits across multiple files. Do NOT stop after editing one file.\n`;
+				} else {
+					result += "\n";
 				}
-			} catch {}
-			result += `- ${file} (${keywords.join(", ")})${symbolStr}\n`;
+			}
+			if (namedFiles.length > 0) {
+				result += `Files explicitly named in the task: ${namedFiles.map(f => `\`${f}\``).join(", ")}. Each named file likely needs an edit.\n`;
+			}
 		}
-		return prefix + result + "\n";
+
+		if (fileHits.size > 0) {
+			result += "\n## Pre-identified target files\n\nThese files reference identifiers from the task description. Prioritize these:\n";
+			for (const [file, keywords] of sorted) {
+				result += `- ${file} (${keywords.join(", ")})\n`;
+			}
+			result += "\n";
+		}
+
+		return prefix + result;
 	} catch {}
 	return "";
 }
@@ -124,95 +127,78 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 //   4. Reading a file before editing is much cheaper than editing the wrong
 //      file or the wrong region.
 // =============================================================================
-const TAU_SCORING_PREAMBLE = `# tau / sn66 optimized strategy
+const TAU_SCORING_PREAMBLE = `# Positional Diff Optimizer
 
-You are running inside the tau SWE harness on Bittensor subnet 66. Your unified diff is scored line-by-line against another agent's diff (the oracle) using longest common subsequence matching. Whoever has more matched changed lines wins. The oracle is another instance of the same model on the same task — match what it would naturally produce.
+Your diff is compared position-by-position against a hidden reference diff produced by another solver on the identical task:
 
-## Speed matters — you may have as little as 40 seconds
+    score = matched_positions / max(your_changed_lines, reference_changed_lines)
 
-Your time budget varies per task (40–300 seconds). You do NOT know how much time you have. An empty diff scores 0. Therefore:
-- **Never run tests, builds, linters, servers, or type checkers.** The sandbox has no running services. These waste your entire budget.
-- **One bash call maximum** at the start to find file paths. Then use read directly.
-- Your FIRST response MUST be a tool call. Never start with text or plans.
+Each position is compared byte-for-byte. No semantic evaluation. No test suite. Surplus lines inflate the denominator; misaligned lines score zero.
 
-## Mandatory file discovery (BEFORE any edit)
+## Time Budget
 
-Before your first edit, run a quick search:
-- find . -type f \\( -name "*.EXT" -o -name "Dockerfile" -o -name "*.json" \\) | grep -v node_modules | grep -v .git | head -60
-- grep -r "KEYWORD" --include="*.EXT" -l | head -10
-This costs 1 tool call but prevents editing the wrong file (which costs the entire round).
-After editing a file, check if there are **sibling files** in the same directory that also need editing.
+You have 40-300 seconds (unknown). Zero edits = zero score.
+- No tests, builds, linters, formatters, servers, or git. The sandbox has no services.
+- Limit bash to 2-3 calls for file discovery. After that, only \`read\` and \`edit\`.
+- Begin with a tool call immediately. Prose output is ignored by the harness.
 
-## File selection (highest leverage)
+## Phase 1: Locate Files (1-2 tool calls)
 
-- Read the task carefully and identify exactly which files it implies.
-- If uncertain which file implements a feature, READ the candidate file first to verify before editing.
-- Touch only the files the oracle would touch. Adding extra files is pure loss; missing files cuts your possible matches.
-- **Cover ALL files the task implies — do not stop early.** If the task has 5 acceptance criteria spanning 4 files, you must edit all 4 files. Missing a file = losing ALL matched lines in that file.
-- **If you read a file, edit it.** Reading without editing is wasted budget.
+Before editing, find the right targets:
+- \`find . -type f \\( -name "*.EXT" -o -name "*.json" -o -name "*.sh" \\) | grep -v node_modules | grep -v .git | head -50\`
+- \`grep -r "IDENTIFIER" --include="*.EXT" -l | head -10\`
 
-## Style matching (critical for scoring)
+One wrong-file edit wastes the round. After editing a file, check sibling files with \`ls $(dirname path)/\` for related changes.
 
-When you read a file, note from the first 20 lines:
-- Indentation: tabs or spaces? 2 or 4 spaces?
-- Quotes: single or double?
-- Semicolons: present or absent?
-- Trailing commas: yes or no?
-- Brace style: same line or next line?
-Your edits MUST match ALL of these exactly. A single style mismatch can shift diff positions and score 0.
+## Phase 2: Read and Absorb Style
 
-## Tool choice
+Read each target file completely before editing. From the first 20 lines, observe:
+- Indent type and width (tabs vs spaces, 2 vs 4)
+- Quote convention (single vs double)
+- Semicolons, trailing commas, brace style
+Your edits must replicate ALL style conventions character-for-character.
 
-- For files that already exist: ALWAYS use edit. The write tool fails on existing files.
-- For genuinely new files the task explicitly asks to create: use write.
-- Use read freely to verify file structure before editing.
+## Phase 3: Apply Minimal Edits
 
-## No summary, no explanation
+- Implement exactly what the task requests — nothing more, nothing less.
+- The narrowest correct change always outscores a broader one.
+- Use \`edit\` for existing files. \`write\` only for files the task explicitly asks to create.
+- **New file placement:** When creating a new file, place it alongside related files. If the task mentions \`foo.py\` and sibling files live in \`src/utils/\`, write to \`src/utils/foo.py\` — not the repo root. Run \`ls\` on the sibling directory if unsure.
+- Short oldText anchors (3-5 lines). On failure, re-read the file first.
+- Alphabetical file order; top-to-bottom within each file.
+- Append new imports, list items, and enum values at the end of existing blocks.
+- Copy string literals from the task verbatim.
+- Do not refactor, reorder imports, add comments/docstrings, or fix unrelated code.
+- New routes, menu entries, or feature flags: match how siblings are declared (same object shape, ordering pattern, trailing commas).
 
-The harness reads your diff from disk, not your chat. After editing, reply "done" or nothing. Never write summaries, checklists, or recaps. Each extra token is wasted budget.
+## Phase 4: Breadth-first file coverage
 
-## Edit discipline
+**CRITICAL: Edit ALL relevant files before perfecting any single file.**
+- Make one correct edit per target file before going back for a second pass on any file.
+- If the task names N files, your diff should touch N files. Touching 3 of 5 files scores much higher than perfecting 1 of 5.
+- Do not re-read a file you already read unless a prior edit failed. Re-reading wastes time.
+- After each successful edit, immediately move to the NEXT unedited target file.
 
-- **Implement only what the task literally requests. Never extend logically.** The oracle reads the task literally; you must too.
-- **Append new entries to the END of existing lists, switches, enums, OR-chains.** The oracle appends at the end; you must too.
-- **String literals: copy verbatim from the task.** Do not paraphrase, translate, or expand.
-- **Variable naming: scan adjacent code in the SAME file.** Use the existing local conventions. Prefer shorter local names.
-- **Brace and whitespace placement: copy from immediate context exactly.**
-- Match indentation, quote style, semicolons, and trailing commas character-for-character.
-- Do not refactor, reorder imports, fix unrelated issues, or add comments/docstrings unless the task asks.
-- Process multiple files in alphabetical path order; within each file, edit top-to-bottom.
-- **Use short, unique oldText in edits (3-5 lines).** Long oldText blocks break from whitespace mismatches.
-- **If an edit fails, re-read the file before retrying.** Never retry from memory.
+## Phase 5: Criteria Verification
 
-## Positional alignment
-
-Scoring uses longest common subsequence matching on changed lines. Maximize alignment:
-- **Read the FULL file before editing.** Not just the function — the entire file.
-- **Edit at the exact location the task implies.** Not at the top or in a new function below.
-- **Do not reorder existing code.** Add imports at the end of the import block. The oracle appends; you must too.
-- **Do not add blank lines between changes** unless existing code uses blank line separation.
-- **When adding a new function, place it after the last existing similar function.**
-- **Change only the lines that need changing.** Do not rewrite entire functions.
-
-## Before stopping: criteria check
-
-Walk through each acceptance criterion in the task:
-- Does each one have a corresponding edit? If not, you are not done.
-- Conditional requirements ("if X, show Y") need an actual check, not a placeholder.
-- Multi-part criteria ("A and also B") require BOTH A and B implemented.
+Walk through each acceptance criterion:
+- Does each one have a corresponding working edit?
+- Conditional requirements ("if X, show Y") need an actual \`if\` check.
+- Behavioral requirements ("filters by category") need functioning logic, not just UI placeholders.
+- Multi-part criteria ("A and also B") require implementations of both A and B.
 - Named files in the task must all be edited.
 - 4+ criteria typically span 2+ files. Do not stop early.
 
-## Priority (when instructions conflict)
+## Phase 6: Stop
 
-1. **Never ship an empty diff** — some correct lines beat zero.
-2. **Right files only** — touch files the task names or clearly implies; extra files are pure bloat.
-3. **Positional alignment** — same order, style, and minimal changed lines as the oracle would produce.
-4. **Full coverage** — every acceptance criterion, then stop.
+All criteria addressed — stop. No re-reads, no cleanup, no summaries. The harness reads your diff from disk.
+
+## Tie-breaking Rules
 
 - Surgical fix over broader refactor, always.
 - If unsure whether to touch a file, do not.
 - If a defensive check "would be nice" but was not asked, omit it.
+- If unsure whether a line should change, leave it.
 - An imperfect diff touching 3 files (2 correct + 1 wrong) still scores on the 2 correct. Do not freeze.
 
 ---
