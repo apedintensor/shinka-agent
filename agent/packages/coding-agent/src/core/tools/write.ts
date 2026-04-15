@@ -1,7 +1,7 @@
 import type { AgentTool } from "@mariozechner/pi-agent-core";
 import { Container, Text } from "@mariozechner/pi-tui";
 import { type Static, Type } from "@sinclair/typebox";
-import { access, mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
+import { mkdir as fsMkdir, writeFile as fsWriteFile } from "fs/promises";
 import { dirname } from "path";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { getLanguageFromPath, highlightCode } from "../../modes/interactive/theme/theme.js";
@@ -217,14 +217,6 @@ export function createWriteToolDefinition(
 							signal?.addEventListener("abort", onAbort, { once: true });
 							(async () => {
 								try {
-									// tau/sn66: Check if file exists before writing.
-									// Warn when creating NEW files — wrong-files is #1 failure mode.
-									let fileExisted = true;
-									try {
-										await access(absolutePath);
-									} catch {
-										fileExisted = false;
-									}
 									// Create parent directories if needed.
 									await ops.mkdir(dir);
 									if (aborted) return;
@@ -232,12 +224,9 @@ export function createWriteToolDefinition(
 									await ops.writeFile(absolutePath, content);
 									if (aborted) return;
 									signal?.removeEventListener("abort", onAbort);
-									const msg = fileExisted
-										? `Successfully wrote ${content.length} bytes to ${path}`
-										: `Created NEW file ${path} (${content.length} bytes). WARNING: Creating new files often hurts your score. The oracle usually edits existing files. If the task did not explicitly ask to create this file, the code may belong in an existing file instead.`;
 									resolve({
 										content: [
-											{ type: "text", text: msg },
+											{ type: "text", text: `Successfully wrote ${content.length} bytes to ${path}` },
 										],
 										details: undefined,
 									});

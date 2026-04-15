@@ -6,7 +6,6 @@ import { execSync } from "node:child_process";
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
-// v037: count acceptance criteria bullets for scope analysis
 function countAcceptanceCriteria(taskText: string): number {
 	const criteriaSection = taskText.match(/(?:acceptance\s+criteria|requirements):?\s*\n([\s\S]*?)(?:\n\n|\n(?=[A-Z])|\n(?=##)|$)/i);
 	if (!criteriaSection) return 0;
@@ -14,7 +13,6 @@ function countAcceptanceCriteria(taskText: string): number {
 	return bullets ? bullets.length : 0;
 }
 
-// v037: extract explicitly named files from task
 function extractNamedFiles(taskText: string): string[] {
 	const filePatterns = taskText.match(/`([^`]+\.[a-zA-Z]{1,6})`/g) || [];
 	return [...new Set(filePatterns.map(f => f.replace(/`/g, '')))];
@@ -22,43 +20,27 @@ function extractNamedFiles(taskText: string): string[] {
 
 function grepTaskKeywords(cwd: string, taskText: string): string {
 	try {
-		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map((k) => k.replace(/`/g, "")) || [];
-
-		// v35: Extract explicit file paths from backtick-quoted strings
-		const explicitPaths = [...new Set(
-			backtickMatches.filter(
-				(k) =>
-					/[\\/]/.test(k) ||
-					/\.(ts|tsx|js|jsx|py|go|java|kt|rb|cs|vue|svelte|json|yaml|yml|rs|swift|php|gradle)$/i.test(k),
-			),
-		)].slice(0, 12);
-
-		let prefix = "";
-		if (explicitPaths.length > 0) {
-			prefix =
-				"\n\n## Paths named in the task\n\nRead these first (no extra discovery needed if the task is explicit):\n" +
-				explicitPaths.map((p) => `- \`${p}\`\n`).join("") +
-				"\n";
-		}
+		const backtickMatches = taskText.match(/`([^`]{2,60})`/g)?.map(k => k.replace(/`/g, '')) || [];
 		const camelMatches = taskText.match(/\b[A-Z][a-z]+(?:[A-Z][a-z]+)+\b/g) || [];
 		const snakeMatches = taskText.match(/\b[a-z]+_[a-z_]+\b/g) || [];
-		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches])]
-			.filter((k) => k.length >= 3 && k.length <= 60)
-			.filter(
-				(k) =>
-					!["the", "and", "for", "with", "that", "this", "from", "should", "must", "when", "each", "into", "also"].includes(
-						k.toLowerCase(),
-					),
-			)
-			.slice(0, 10);
-		if (allKeywords.length === 0) return prefix;
+		const kebabMatches = taskText.match(/\b[a-z][a-z0-9]*(?:-[a-z0-9]+)+\b/g) || [];
+		const pathLikeMatches =
+			taskText.match(/(?:\/|\b)(?:[\w.-]+\/)+[\w.-]+\b/g)?.map((p) => p.replace(/^\//, "").trim()) || [];
+		const allKeywords = [...new Set([...backtickMatches, ...camelMatches, ...snakeMatches, ...kebabMatches, ...pathLikeMatches])]
+			.filter(k => k.length >= 3 && k.length <= 80)
+			.filter(k => !/["'`]/.test(k))
+			.filter(k => !['the', 'and', 'for', 'with', 'that', 'this', 'from', 'should', 'must', 'when', 'each', 'into', 'also'].includes(k.toLowerCase()))
+			.slice(0, 12);
+		if (allKeywords.length === 0) return "";
 		const fileHits = new Map<string, string[]>();
+		const includeGlobs =
+			'--include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.mjs" --include="*.cjs" --include="*.py" --include="*.go" --include="*.java" --include="*.kt" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.vue" --include="*.css" --include="*.scss" --include="*.html" --include="*.json" --include="*.md"';
 		for (const keyword of allKeywords) {
 			try {
-				const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+				const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 				const result = execSync(
-					`grep -rl "${escaped}" --include="*.ts" --include="*.tsx" --include="*.js" --include="*.jsx" --include="*.py" --include="*.go" --include="*.java" --include="*.kt" --include="*.dart" --include="*.rb" --include="*.cs" --include="*.vue" . 2>/dev/null | grep -v node_modules | grep -v .git | grep -v dist/ | grep -v build/ | head -10`,
-					{ cwd, timeout: 3000, encoding: "utf-8" },
+					`grep -rl "${escaped}" ${includeGlobs} . 2>/dev/null | grep -v node_modules | grep -v .git | grep -v dist/ | grep -v build/ | head -10`,
+					{ cwd, timeout: 3000, encoding: "utf-8" }
 				).trim();
 				if (result) {
 					for (const file of result.split("\n")) {
@@ -69,10 +51,8 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 				}
 			} catch {}
 		}
-		if (fileHits.size === 0) return prefix;
 		const sorted = [...fileHits.entries()].sort((a, b) => b[1].length - a[1].length).slice(0, 15);
 
-		// v037: scope analysis — criteria count + named files
 		const criteriaCount = countAcceptanceCriteria(taskText);
 		const namedFiles = extractNamedFiles(taskText);
 
@@ -100,33 +80,13 @@ function grepTaskKeywords(cwd: string, taskText: string): string {
 			result += "\n";
 		}
 
-		return prefix + result;
+		return result;
 	} catch {}
 	return "";
 }
 
-// =============================================================================
-// tau / sn66 strategy preamble — baked into the system prompt so it is loaded
-// on every invocation, independent of project-context-file resolution.
-//
-// Scoring (verified in tau/src/compare.py):
-//   - Validator runs cursor on the same task as the live oracle.
-//   - For each agent: changed_sequence(orig, agent_repo) is built per file
-//     using difflib.SequenceMatcher (top-to-bottom file order, "-:" lines
-//     first then "+:" lines per replace block).
-//   - matched_changed_lines = sum over files of zip(seq_a, seq_b) positional
-//     equality.
-//   - Winner = whoever has more matched_changed_lines vs the cursor oracle.
-//
-// Implications driving the rules below:
-//   1. Touching files cursor would not touch is pure loss (bloat).
-//   2. Missing files cursor would touch forfeits all matches on that file.
-//   3. Wholesale `write` of an existing file generates a huge changed
-//      sequence that almost never positionally aligns with cursor's
-//      surgical `edit`. Use `edit` for existing files.
-//   4. Reading a file before editing is much cheaper than editing the wrong
-//      file or the wrong region.
-// =============================================================================
+// Positional-match preamble injected on every invocation.
+// Keeps the model focused on minimal, style-accurate diffs.
 const TAU_SCORING_PREAMBLE = `# Positional Diff Optimizer
 
 Your diff is compared position-by-position against a hidden reference diff produced by another solver on the identical task:
@@ -243,11 +203,12 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const appendSection = appendSystemPrompt ? `\n\n${appendSystemPrompt}` : "";
 
+	const keywordHits = customPrompt ? grepTaskKeywords(resolvedCwd, customPrompt) : "";
+
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		const keywordHits = grepTaskKeywords(resolvedCwd, customPrompt);
 		let prompt = TAU_SCORING_PREAMBLE + keywordHits + customPrompt;
 
 		if (appendSection) {

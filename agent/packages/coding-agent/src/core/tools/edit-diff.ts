@@ -112,54 +112,6 @@ export function fuzzyFindText(content: string, oldText: string): FuzzyMatchResul
 	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
 	if (fuzzyIndex === -1) {
-		// Pass 3: indentation-blind match. The LLM frequently gets leading
-		// whitespace wrong while the semantic content is correct. Strip all
-		// leading whitespace per line to find the match, then map back to
-		// original positions so the replacement preserves file indentation.
-		const fuzzyLines = fuzzyContent.split("\n");
-		const strippedLines = fuzzyLines.map((line) => line.trimStart());
-		const oldTextStripped = fuzzyOldText.split("\n").map((line) => line.trimStart());
-
-		// Find matching start line in stripped content
-		const oldFirstLine = oldTextStripped[0];
-		let matchStartLine = -1;
-		for (let i = 0; i <= strippedLines.length - oldTextStripped.length; i++) {
-			if (strippedLines[i] === oldFirstLine) {
-				// Check all lines match
-				let allMatch = true;
-				for (let j = 1; j < oldTextStripped.length; j++) {
-					if (strippedLines[i + j] !== oldTextStripped[j]) {
-						allMatch = false;
-						break;
-					}
-				}
-				if (allMatch) {
-					matchStartLine = i;
-					break;
-				}
-			}
-		}
-
-		if (matchStartLine !== -1) {
-			// Map back to original fuzzyContent: find char offset of matchStartLine
-			let charOffset = 0;
-			for (let i = 0; i < matchStartLine; i++) {
-				charOffset += fuzzyLines[i].length + 1; // +1 for \n
-			}
-			// Length of matched region in original content
-			let matchLen = 0;
-			for (let i = matchStartLine; i < matchStartLine + oldTextStripped.length; i++) {
-				matchLen += fuzzyLines[i].length + (i < matchStartLine + oldTextStripped.length - 1 ? 1 : 0);
-			}
-			return {
-				found: true,
-				index: charOffset,
-				matchLength: matchLen,
-				usedFuzzyMatch: true,
-				contentForReplacement: fuzzyContent,
-			};
-		}
-
 		return {
 			found: false,
 			index: -1,
@@ -192,38 +144,14 @@ function countOccurrences(content: string, oldText: string): number {
 	return fuzzyContent.split(fuzzyOldText).length - 1;
 }
 
-function getNotFoundError(path: string, editIndex: number, totalEdits: number, fileContent?: string, searchText?: string): Error {
-	let hint = "";
-	if (fileContent && searchText) {
-		const searchFirstLine = searchText.split("\n")[0].trim();
-		if (searchFirstLine.length > 5) {
-			const fileLines = fileContent.split("\n");
-			const scored: { line: number; text: string; score: number }[] = [];
-			for (let i = 0; i < fileLines.length; i++) {
-				const fileLine = fileLines[i].trim();
-				if (fileLine.length < 3) continue;
-				// Simple similarity: count common words
-				const searchWords = new Set(searchFirstLine.toLowerCase().split(/\s+/));
-				const fileWords = fileLine.toLowerCase().split(/\s+/);
-				const common = fileWords.filter((w) => searchWords.has(w)).length;
-				if (common >= 2) {
-					scored.push({ line: i + 1, text: fileLine.slice(0, 120), score: common });
-				}
-			}
-			scored.sort((a, b) => b.score - a.score);
-			const top = scored.slice(0, 3);
-			if (top.length > 0) {
-				hint = "\nClosest matches in file:\n" + top.map((m) => `  line ${m.line}: ${m.text}`).join("\n") + "\nTry using text from one of these lines as your oldText.";
-			}
-		}
-	}
+function getNotFoundError(path: string, editIndex: number, totalEdits: number): Error {
 	if (totalEdits === 1) {
 		return new Error(
-			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.${hint}`,
+			`Could not find the exact text in ${path}. The old text must match exactly including all whitespace and newlines.`,
 		);
 	}
 	return new Error(
-		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.${hint}`,
+		`Could not find edits[${editIndex}] in ${path}. The oldText must match exactly including all whitespace and newlines.`,
 	);
 }
 
@@ -288,7 +216,7 @@ export function applyEditsToNormalizedContent(
 		const edit = normalizedEdits[i];
 		const matchResult = fuzzyFindText(baseContent, edit.oldText);
 		if (!matchResult.found) {
-			throw getNotFoundError(path, i, normalizedEdits.length, baseContent, edit.oldText);
+			throw getNotFoundError(path, i, normalizedEdits.length);
 		}
 
 		const occurrences = countOccurrences(baseContent, edit.oldText);

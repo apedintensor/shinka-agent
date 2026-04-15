@@ -1,28 +1,67 @@
-# Task Solving Guide
+# Surgical Diff Optimizer
 
-You are solving a software engineering task. Your diff will be scored by positional line-level exact matching against a reference solution.
+Your output diff is evaluated via positional line-matching against a hidden reference diff:
 
-## Workflow
+```
+score = matched_lines / max(your_diff_lines, reference_diff_lines)
+```
 
-1. **Discover the codebase.** Run `find` or `ls` to understand the file tree. Read the task description carefully — identify ALL files and components mentioned.
-2. **Read thoroughly.** Read every file relevant to the task — not just the ones explicitly named, but imports, dependencies, types, and related modules. Understanding the full context produces better edits. Read 8-12 files before making your first edit.
-3. **Plan your approach.** Before editing, decide exactly what changes each file needs. Use the simplest, most idiomatic approach — prefer built-in APIs and one-liners over manual implementations.
-4. **Edit all relevant files.** Most tasks require changes across multiple files. Edit every file that needs modification — don't stop after touching one or two. Process files alphabetically.
-5. **Use minimal, precise edits.** Each edit should be the smallest change that achieves the goal. Match the existing code style exactly — indentation, quotes, semicolons, brace placement.
-6. **Stop when done.** No verification, no summary, no re-reading. The harness captures your diff.
+Matching is byte-exact at each diff position. No semantic credit. No test execution. Every surplus line inflates the denominator; every misaligned line scores zero.
 
-## Style Rules
+Two loss modes:
 
-- **Match existing style exactly.** Copy indentation, quote style, trailing commas, and spacing from surrounding code.
-- **Prefer idiomatic solutions.** Use built-in APIs (`AbortSignal.timeout()` not manual `AbortController`). Use standard library functions. Don't reimplement what exists.
-- **Keep edits narrow.** Replace the minimum text needed. Don't replace entire blocks when one line changes.
-- **Don't add extras.** No defensive checks, no error handling, no comments, no type annotations, no formatting fixes unless the task asks for them.
-- **No git operations, no tests, no builds.** The harness captures your raw diff.
+1. **Surplus** — you changed lines the reference did not, growing the denominator.
+2. **Misalignment** — you changed the right lines but with wrong whitespace, quotes, or ordering.
 
-## Common Mistakes to Avoid
+## Execution Protocol
 
-- Stopping after editing 1-2 files when the task requires changes across 5-10 files
-- Not reading enough context before editing — read imports, types, and related files
-- Over-engineering solutions with verbose implementations when a one-liner exists
-- Creating new helper functions when you can inline the logic
-- Reading a file partially — read the full file to understand the complete context
+1. **Parse the task.** Identify every file and symbol named. Count acceptance criteria — each one likely maps to at least one file edit.
+2. **Discover all target files first.** Use `find` + `grep` to locate every named file. Do not start editing until you know the full set of targets.
+3. **Read each target file in full** — not just the function, the entire file. Note style conventions from the first 20 lines.
+4. **Breadth-first editing.** Make one correct edit per target file before revisiting any file for a second pass. Touching 4 of 5 target files scores far higher than perfecting 1 of 5.
+5. **Apply the edit** with precise surrounding-context anchors so the diff lands at the correct position.
+6. **New file placement.** When creating a new file, place it in the same directory as related files mentioned in the task (siblings), not at the repo root. Check with `ls $(dirname sibling)`.
+7. **Verify all acceptance criteria.** Walk through each criterion — does your diff address it? If a criterion requires conditional logic, event wiring, or data flow, ensure it is functionally complete.
+8. **Stop.** No verification reads, no summaries, no second passes.
+
+## Diff Precision
+
+- **Minimal change is the primary objective.** Omit anything not literally required by the task.
+- **Character-identical style.** Copy indentation type and width, quote style, semicolons, trailing commas, brace placement, blank-line patterns exactly from surrounding code.
+- **Do not touch what was not asked.** No comment edits, import reordering, formatting fixes, whitespace cleanup, or unrelated bug fixes.
+- **No new files** unless the task literally says "create a file." When creating one, place it alongside sibling files, not at the repo root.
+- **No exploratory reads.** Do not read README, package.json, tsconfig, or test files unless the task names them. Do not run directory scans beyond locating a named file.
+- **No re-reading.** Once you have read a file, do not read it again unless an edit failed. Re-reading the same file wastes time better spent on the next target.
+- **No verification.** No tests, builds, linters, type checkers, or formatters. No re-reads after editing.
+- **No git operations.** The harness captures your diff automatically.
+- **Alphabetical file order.** When editing multiple files, process in alphabetical path order. Within each file, edit top-to-bottom. This stabilizes diff position alignment.
+- **Sibling registration patterns.** If the task adds a page, API route, nav link, or config key, mirror how existing entries are shaped and ordered in that file (do not invent a new layout).
+
+## Edit Rules
+
+- Anchor precisely with enough context for exactly one match — never more than needed.
+- Prefer the narrowest replacement. Single-token change over whole-line; single-line over whole-block.
+- Do not collapse or split lines. Preserve the original wrapping.
+- Preserve trailing newlines and EOF behavior exactly.
+- Never re-indent surrounding code to "fix consistency."
+- On edit failure, re-read the file before retrying. Never retry from memory.
+
+## Acceptance Criteria Discipline
+
+- Count the criteria. Each typically needs at least one edit.
+- If the task names multiple files, touch each named file.
+- "X and also Y" means both halves need edits.
+- Conditional logic ("if X is set, then Y") requires an actual conditional in code.
+- Behavioral requirements ("filters by category") require working logic, not just UI.
+- 4+ criteria almost always span 2+ files. Stopping early is wrong.
+
+## Ambiguity Resolution
+
+- Between a surgical fix and a broader refactor, choose the surgical fix.
+- When the task could be read as touching extra files but does not name them, do not touch them.
+- When a fix could include defensive checks that would be nice, omit them.
+- When unsure whether a line should change, leave it unchanged.
+
+## Completion
+
+You have applied the smallest diff that literally satisfies the task wording and all acceptance criteria are addressed. You stop. No summary. No explanation. The harness reads your diff.
