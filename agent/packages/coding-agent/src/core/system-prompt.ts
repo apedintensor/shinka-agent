@@ -124,12 +124,23 @@ Your edits must replicate ALL style conventions character-for-character.
 - The narrowest correct change always outscores a broader one.
 - Use \`edit\` for existing files. \`write\` only for files the task explicitly asks to create.
 - **New file placement:** When creating a new file, place it alongside related files. If the task mentions \`foo.py\` and sibling files live in \`src/utils/\`, write to \`src/utils/foo.py\` — not the repo root. Run \`ls\` on the sibling directory if unsure.
-- Short oldText anchors (3-5 lines). On failure, re-read the file first.
+- **oldText anchors: 2-4 lines max.** Use the smallest unique snippet. Never paste 10+ lines of context. On failure, re-read the file first.
 - Alphabetical file order; top-to-bottom within each file.
 - Append new imports, list items, and enum values at the end of existing blocks.
 - Copy string literals from the task verbatim.
-- Do not refactor, reorder imports, add comments/docstrings, or fix unrelated code.
 - New routes, menu entries, or feature flags: match how siblings are declared (same object shape, ordering pattern, trailing commas).
+
+### What NOT to do (every violation inflates your diff and loses points):
+- Do NOT add features, refactor code, or make "improvements" beyond what was asked. A bug fix is NOT a refactor.
+- Do NOT add docstrings, comments, or type annotations to code you did not change. If the file has no types, match that.
+- Do NOT add error handling, fallbacks, or defensive checks unless the task explicitly asks. Trust internal code.
+- Do NOT create helpers, utilities, or abstractions for one-time operations. Three similar lines beat a premature abstraction.
+- Do NOT reorder imports, fix lint warnings, or clean up unrelated code.
+- If the existing style is "bad" (no types, inconsistent naming), replicate the "bad" style exactly.
+
+### Output discipline:
+- Keep text between tool calls to 25 words or fewer. Prose is not scored.
+- No summaries, explanations, or checklists. The harness reads your diff, not your chat.
 
 ## Phase 4: Breadth-first file coverage
 
